@@ -235,7 +235,7 @@ Later you can split:
 
 Sanitization checklist:
 
-- Replace absolute paths like `/home/enzo` with `~`, `$HOME`, or placeholders.
+- Replace absolute paths like `/home/<user>` with `~`, `$HOME`, or placeholders.
 - No personal project names in examples; use `example`/`acme`.
 - `.gitignore`: `.agent/`, `*.jsonl`, `auth.json`, `.env`, `logs/`, `node_modules/`.
 - Never commit session data, API keys, or generated artifacts.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 — 2026-10-20
+
+- Add `CREDITS.md` with upstream extension/project citations.
+- Clarify that Continuum composes rather than vendors upstream packages.
+- Remove personal test paths from design docs.
+
 ## 0.1.2 — 2026-10-20
 
 - Fix direct project-command launch when the wrapper is invoked with no arguments. The default open namespace was missing `no_preflight`.
