@@ -825,7 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     invoked = Path(sys.argv[0]).name
     if invoked not in {"pi-project", "pi-project.py", "continuum"} and len(sys.argv) == 1:
-        return cmd_open(argparse.Namespace(name=invoked, no_tmux=False, dry_run=False))
+        return cmd_open(argparse.Namespace(name=invoked, no_tmux=False, dry_run=False, no_preflight=False))
     parser = build_parser()
     args = parser.parse_args()
     return args.func(args)

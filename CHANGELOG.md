@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-10-20
+
+- Fix direct project-command launch when the wrapper is invoked with no arguments. The default open namespace was missing `no_preflight`.
+
 ## 0.1.1 — 2026-10-20
 
 - Choose a wrapper directory that is already on `PATH` (prefers `~/.local/bin`, falls back to `~/.pi/agent/bin`).
