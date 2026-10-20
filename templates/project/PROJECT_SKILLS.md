@@ -64,6 +64,18 @@ Load it only in the agent that needs it. Do not load every extension into the le
 5. Never put secrets in a skill or extension. Use environment variables or Pi auth.
 6. Review any project skill or extension before granting project trust.
 
+## Capability acceptance
+
+A skill or extension is not adopted just because it exists. Before it becomes part of the project:
+
+1. Define the smallest representative task it should improve.
+2. Run that task with the current baseline. Record pass/fail, token cost, and wall-clock time.
+3. Run the same task with the new capability.
+4. Keep it only if it improves a metric that matters, or materially reduces risk.
+5. Record the result in `PLAN.md` or the project notes, and assign the capability only to the specialist that needs it.
+
+If it adds complexity without a measured benefit, remove or disable it. Do not build a separate plugin library; the project's `.pi/skills/` and `.pi/extensions/` are the library. Do not add a capability to the lead unless it is an orchestration or verification gate.
+
 ## Suggested workflow
 
 Ask the lead:

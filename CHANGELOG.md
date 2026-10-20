@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Document the default delegation depth, no-auto-spawn rule, and worktree condition in the project template.
+- Add a capability-acceptance check for project skills/extensions.
+- Add research notes for Meta-Harness, PluginRSI, Inside the Scaffold, the missing knowledge layer, and Jev decision-controller counterevidence.
+- Document deliberate non-goals: no runtime topology router, no recursive spawning, no Jev controller, and no observational memory in the lead.
+
 ## 0.1.7 — 2026-10-20
 
 - Remove Continuum npm packaging/publishing instructions.

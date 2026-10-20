@@ -23,6 +23,17 @@ The paper treats context as a file the model can edit, rather than an append-onl
 
 Continuum uses that idea through `pi-clm`. The generic template uses a 256K budget and 32K reserve; DeepSeek-specific starting points are documented in [docs/CLM-DEEPSEEK.md](./CLM-DEEPSEEK.md), including a 272K/64K high-effort profile and a 384K/128K max-effort profile.
 
+### The Missing Knowledge Layer
+
+- **Paper:** *The Missing Knowledge Layer in Cognitive Architectures for AI Agents*
+- **Author:** Michaël Roynard
+- **Date:** 2026-04-13 (v2 2026-06-12)
+- **arXiv:** <https://arxiv.org/abs/2604.11364>
+- **Status:** position paper
+- **Informed:** the separation between CLM working context, durable task state (`TASK.md`, `PLAN.md`, `VERDICT.json`), and the raw archived session. It argues that facts, experiences, and active inference need different persistence semantics, which is why Continuum does not collapse them into one memory store.
+
+The paper argues that Knowledge, Memory, Wisdom, and Intelligence need different persistence semantics: indefinite supersession for facts, Ebbinghaus decay for experiences, evidence-gated revision, and ephemeral inference. It cites Mastra’s Observational Memory result (94.87% on LongMemEval) but also cites a community audit reporting problems with LoCoMo and LongMemEval, so Continuum treats that number as provisional rather than as proof.
+
 ### Contextual Agentic Memory is a Memo, Not True Memory
 
 - **Authors:** Binyan Xu, Xilin Dai, Kehuan Zhang
@@ -58,6 +69,17 @@ Continuum does not implement MAGE’s full tree machinery; it adopts the design 
 - **Informed:** the small specialist tree: a lead plus scout, implementer, and verifier; not a wide agent swarm.
 
 Reported result: 53.1% on SWE-bench Verified and 20.0% on SWE-bench-Live with a 36B model; top-2 discovered specialists beat top-3/4/5 teams.
+
+### Inside the Scaffold
+
+- **Paper:** *Inside the Scaffold: A Source-Code Taxonomy of Coding Agent Architectures*
+- **Author:** Benjamin Rombaut
+- **Date:** 2026-04-03 (v2 2026-04-10)
+- **arXiv:** <https://arxiv.org/abs/2604.03515>
+- **Status:** preprint
+- **Informed:** the decision to keep Pi’s loop as the trunk and treat tree search as a specialist primitive rather than the default.
+
+The taxonomy covers 13 open-source coding-agent scaffolds. It identifies five composable loop primitives — ReAct, generate-test-repair, plan-execute, multi-attempt retry, and tree search — and finds that 11 of 13 compose multiple primitives. Control strategies range from fixed pipelines to MCTS, but the common substrate is a loop with tools and context management. Continuum’s lead/scout/implementer/verifier roles are a small specialist tree layered on that loop, not a replacement for it.
 
 ### Decomposition Buys Integrity, Not Yield
 
@@ -135,6 +157,30 @@ Reported results:
 
 Continuum uses the principle, not the full logprob/tournament implementation. Deterministic tests remain the primary gate.
 
+## Decision routing
+
+### REFLEX with Jev
+
+- **Paper:** *REFLEX with Jev for Efficient Selective Control in LLM Agents*
+- **Authors:** Tiantong Wu and 1 other author
+- **Date:** 2026-09-22
+- **arXiv:** <https://arxiv.org/abs/2609.26532>
+- **Status:** preprint
+- **Informed:** why Continuum does not use a learned router by default; the verifier gate stays explicit and deterministic.
+
+REFLEX uses Jev as a fast typed decision layer and calls a strong LLM when confidence is low or generation is required. On a frozen 100-task benchmark it reports 95% success with 72.7% fewer strong-model calls, with reductions across three fallback families. The paper also reports limited advantage over a cheap generative cascade on external BFCL and τ-style evaluations. Continuum therefore treats typed routing as an optional experiment, not a default component.
+
+### Good Judgment, Bad Advice
+
+- **Paper:** *Good Judgment, Bad Advice: Decision-Model Controllers Raise Agent Cost Without Improving Success*
+- **Author:** Naman Vats
+- **Date:** 2026-10-17
+- **arXiv:** <https://arxiv.org/abs/2610.24649>
+- **Status:** preprint
+- **Informed:** the decision not to add a Jev-style controller to the lead loop.
+
+In a pre-specified Terminal-Bench 2.1 study (21 tasks, 315 trials), a Jev controller raised cost per attempt by 19% at an identical 73.0% pass rate. It was cheaper than a small-LLM controller but 22% more expensive than a placebo, and it was poorly calibrated: its mean probability that a run was complete was 0.50 when 87% of those runs passed. The result is a warning that a typed decision layer is not automatically cheaper or better.
+
 ## Harness engineering
 
 ### AI Harness Engineering
@@ -154,6 +200,28 @@ Continuum uses the principle, not the full logprob/tournament implementation. De
 - **arXiv:** <https://arxiv.org/abs/2605.18747>
 - **Status:** survey preprint
 - **Informed:** treating code, project layout, and executable checks as the substrate of the agent system.
+
+### Meta-Harness
+
+- **Paper:** *Meta-Harness: End-to-End Optimization of Model Harnesses*
+- **Authors:** Yoonho Lee and 5 other authors
+- **Date:** 2026-03-30
+- **arXiv:** <https://arxiv.org/abs/2603.28052>
+- **Status:** preprint
+- **Informed:** the `toolsmith` workflow and the requirement to evaluate a capability before keeping it.
+
+Meta-Harness searches over harness code with an agentic proposer that can inspect source, scores, and execution traces. Reported results: 7.7 points better with 4× fewer context tokens on online text classification; 4.7 points average gain on 200 IMO-level problems across five held-out models; and discovered harnesses that surpass the best hand-engineered baselines on TerminalBench-2. The lesson for Continuum is capability-level search with trace access, not a fixed mega-harness.
+
+### PluginRSI
+
+- **Paper:** *PluginRSI: Recursive Improvement of Agent Harnesses with Reusable Plugins*
+- **Authors:** Yaorui Shi, Yuchun Miao, Yuxin Chen, Jiayuan Zhang, Yueqing Sun, Xierui Song, Xiang Wang, An Zhang
+- **Date:** 2026-09-25
+- **arXiv:** <https://arxiv.org/abs/2609.32423>
+- **Status:** preprint
+- **Informed:** project-local skills/extensions as reusable capabilities, and the need for a small acceptance test before adoption.
+
+PluginRSI represents a harness as atomized plugins, improves them independently, accumulates them in a library, and recombines them. Reported results: 6–10 percentage points over Meta-Harness on SWE-bench Verified, and a 69% held-out resolve rate after two evolution steps with library reuse versus 65% without. This supports `toolsmith` and `PROJECT_SKILLS.md`, but only with evaluation; a plugin library without task-level checks is just accumulation.
 
 ### Grow the Harness, Not the Context
 
@@ -175,8 +243,32 @@ Continuum uses the principle, not the full logprob/tournament implementation. De
 
 The paper attributes an average of 54% of measured gains to overfitting and 14% to test-time scaling; gains often fail to transfer to held-out tasks.
 
+## How Continuum applies this
+
+| Continuum choice | Research basis | Implementation |
+|---|---|---|
+| Pi loop as the trunk | Inside the Scaffold; Decomposition Buys Integrity, Not Yield | Pi core loop; `AGENTS.md` required flow |
+| Lead-only CLM | CLM; The Missing Knowledge Layer | `.pi/settings.json`, `CLM_STEERING.md`, `AGENTS.md` |
+| Small specialist tree | BOAD; MS-Eval; When Sub-Agents Work in Parallel | `.pi/agents/`, delegation rules |
+| Depth 2 and no auto-spawn | Decomposition; When Sub-Agents Work in Parallel | `AGENTS.md` |
+| Independent verifier gate | LLM-as-a-Verifier | `verifier.md`, `VERDICT.json` |
+| Project-local capabilities | Meta-Harness; PluginRSI; Grow the Harness, Not the Context | `toolsmith.md`, `PROJECT_SKILLS.md` |
+| No Jev controller | REFLEX with Jev; Good Judgment, Bad Advice | `AGENTS.md`, `README.md` non-goals |
+| No observational memory in the lead | The Missing Knowledge Layer; CLM | `AGENTS.md`, `README.md` non-goals |
+| UTC-traceable archives | AI Harness Engineering | `extensions/continuum.ts`, `bin/continuum` |
+
+## Deliberate non-goals
+
+- No runtime topology router or auto-spawner in the base template. The lead decides delegation from `PLAN.md`; AdaptOrch is design inspiration, not a runtime dependency.
+- No recursive specialist spawning. The default depth is 2, and a specialist needs lead approval to delegate further.
+- No Jev-style decision controller. Deterministic checks and the read-only verifier are the stop/verify gate.
+- No observational memory or second compaction manager in the lead. CLM is the only context manager.
+- No parallel implementers without isolated worktrees. The default is one writer.
+- No separate plugin library. Project-local `.pi/skills/` and `.pi/extensions/` are the library.
+
 ## Evidence caveats
 
 - Several papers above are preprints. Continuum’s defaults are engineering choices informed by them, not proofs that Continuum itself replicates their results.
+- The Meta-Harness, PluginRSI, REFLEX, and Jev-controller results are preprints; none evaluates Continuum or Pi directly. Treat them as design evidence, not product claims.
 - The model and harness landscape changes quickly. Re-run `make test` and your own held-out tasks before relying on a new default.
 - No paper guarantees “100% best results.” Continuum’s verification gate makes failure visible and recoverable; it does not eliminate model error.

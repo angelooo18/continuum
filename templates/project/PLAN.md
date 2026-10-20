@@ -15,6 +15,7 @@
 - [ ] Tests:
 - [ ] Lint/typecheck:
 - [ ] Acceptance checks:
+- [ ] Capability acceptance (if adding a skill/extension):
 - [ ] Independent verifier:
 
 ## Notes

@@ -40,4 +40,5 @@ You create project-local capabilities only when asked. You do not modify the Con
 - Do not overwrite existing project files without explicit approval.
 - Prefer a skill over an extension unless executable behavior is required.
 - Run the project's typecheck/test command when available.
+- Define a representative task and record the before/after result; do not keep a capability that adds complexity without a measured benefit.
 - Report exactly what changed and how to verify it.

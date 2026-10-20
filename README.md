@@ -228,6 +228,18 @@ Add them per project when needed. `PROJECT_SKILLS.md` documents the workflow.
 
 This improves reliability; it does not guarantee “100% correct” results.
 
+## Design constraints
+
+Continuum deliberately keeps the delegation tree shallow:
+
+- the lead chooses delegation from `PLAN.md`; the default depth is 2;
+- specialists do not auto-spawn or recursively spawn other specialists;
+- parallel writers require isolated worktrees; otherwise implementation stays serial;
+- there is no runtime topology router, no Jev-style decision controller, and no observational-memory layer in the lead;
+- CLM is the only context manager in the lead, and `TASK.md`, `PLAN.md`, and `VERDICT.json` are the durable state.
+
+Project-local skills and extensions are evaluated before adoption. See [RESEARCH.md](./RESEARCH.md) for the evidence and deliberate non-goals.
+
 ## Backup
 
 State is local by default. Configure `backup.command` in `.agent/project.json` and run:
