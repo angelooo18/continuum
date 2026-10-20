@@ -1,6 +1,6 @@
 {
   "name": "pi-continuum",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Continuum: project runtime for Pi with CLM, subagents, UTC session archives, and verification gates.",
   "type": "module",
   "license": "MIT",

@@ -19,7 +19,7 @@ It is packaged as a Pi package plus a thin `continuum` launcher.
 - `tmux` recommended for instant attach/resume; without it, Continuum runs Pi directly
 - A model provider configured in Pi (for example DeepSeek via `/login deepseek`)
 
-Continuum 0.1.0 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
+Continuum 0.1.1 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
 
 ## Install
 
@@ -35,7 +35,7 @@ continuum --help
 ### From npm, once published
 
 ```bash
-npm install -g pi-continuum@0.1.0
+npm install -g pi-continuum@0.1.1
 continuum --help
 ```
 
@@ -44,7 +44,7 @@ continuum --help
 `pi-continuum` also ships the Continuum extension as a Pi package resource. Core agents and skills are installed into each project by `continuum new`.
 
 ```bash
-pi install npm:pi-continuum@0.1.0
+pi install npm:pi-continuum@0.1.1
 ```
 
 If you install the Pi package globally, create projects with:
@@ -80,7 +80,7 @@ acme/
 └── PROJECT_SKILLS.md       how to add project-local capabilities
 ```
 
-`acme` is a generated wrapper for `continuum open acme`.
+`acme` is a generated wrapper for `continuum open acme`. The wrapper is placed in `~/.local/bin` when that directory is on `PATH`; otherwise Continuum uses `~/.pi/agent/bin`.
 
 On first run, Pi will ask you to trust the project configuration. Review `.pi/` before approving.
 

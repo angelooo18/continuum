@@ -190,6 +190,16 @@ def copy_runtime_extension(root: Path, force: bool = False) -> None:
     shutil.copy2(source, destination)
 
 
+def wrapper_dir() -> Path:
+    """Prefer a user bin directory that is already on PATH."""
+    path_dirs = {Path(item).expanduser().resolve() for item in os.environ.get("PATH", "").split(os.pathsep) if item}
+    candidates = [HOME / ".local" / "bin", HOME / ".pi" / "agent" / "bin"]
+    for candidate in candidates:
+        if candidate.resolve() in path_dirs:
+            return candidate
+    return candidates[0]
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     name = safe_name(args.name)
     registry = load_registry()
@@ -238,8 +248,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     save_registry(registry)
 
     linked = False
+    link: Path | None = None
     if not args.no_link:
-        bin_dir = HOME / ".local" / "bin"
+        bin_dir = wrapper_dir()
         bin_dir.mkdir(parents=True, exist_ok=True)
         link = bin_dir / name
         target = Path(__file__).resolve()
@@ -260,9 +271,13 @@ def cmd_new(args: argparse.Namespace) -> int:
     print(f"  repo:    {repo}")
     print(f"  state:   {repo / '.agent'}")
     print(f"  config:  {repo / '.pi'}")
-    print(f"  wrapper: {HOME / '.local' / 'bin' / name if linked else '(not linked)'}")
+    print(f"  wrapper: {link if linked else '(not linked)'}")
     print()
     print("Next: review .pi/settings.json, then run:")
+    if linked and link:
+        path_dirs = {Path(item).expanduser().resolve() for item in os.environ.get("PATH", "").split(os.pathsep) if item}
+        if link.parent.resolve() not in path_dirs:
+            print(f"  warning: {link.parent} is not on PATH; add it to use `{name}` directly")
     print(f"  {name}" if linked else f"  continuum open {name}")
     return 0
 

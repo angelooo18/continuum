@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-10-20
+
+- Choose a wrapper directory that is already on `PATH` (prefers `~/.local/bin`, falls back to `~/.pi/agent/bin`).
+- Warn when the wrapper directory is not on `PATH`.
+- Remove the wrapper from both locations in the desktop cleanup script.
+- Document the GitHub install path.
+
 ## 0.1.0 — 2026-10-20
 
 Initial Continuum package.
