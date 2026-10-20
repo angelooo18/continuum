@@ -1,0 +1,19 @@
+# Runtime state and private data
+.agent/*
+!.agent/project.example.json
+*.jsonl
+auth.json
+.env
+.env.*
+logs/
+*.log
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

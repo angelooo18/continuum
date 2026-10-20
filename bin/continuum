@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""
+Continuum — draft prototype
+
+Bind a repository to a project name, resume its Pi session, and keep
+UTC-traceable day snapshots under .agent/.
+
+This is intentionally conservative and dependency-free. It does not install
+packages or start Pi during `new`. It is meant for review before hardening.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+REGISTRY = HOME / ".pi" / "projects" / "registry.json"
+TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "project"
+DEFAULT_MODEL = "deepseek/deepseek-flash"
+DEFAULT_VERIFIER = "deepseek/deepseek-flash"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def safe_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")
+    if not cleaned:
+        raise SystemExit("project name must contain at least one letter or number")
+    if not cleaned[0].isalnum():
+        cleaned = f"p-{cleaned}"
+    return cleaned
+
+
+def load_registry() -> dict:
+    try:
+        return json.loads(REGISTRY.read_text())
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid registry {REGISTRY}: {exc}") from exc
+
+
+def save_registry(registry: dict) -> None:
+    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY.with_suffix(f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(registry, indent=2) + "\n")
+    tmp.replace(REGISTRY)
+
+
+def project_dir(name: str) -> Path:
+    entry = load_registry().get(name)
+    if not entry:
+        raise SystemExit(f"unknown project: {name}")
+    return Path(entry["repo"]).expanduser().resolve()
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON {path}: {exc}") from exc
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_complete_jsonl(path: Path) -> str:
+    raw = path.read_text(errors="replace")
+    kept: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            break
+        kept.append(line)
+    return "\n".join(kept) + "\n"
+
+
+def append_ledger(root: Path, event: str, **fields) -> None:
+    path = root / ".agent" / "ledger.ndjson"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": utc_now(), "event": event, **fields}
+    with path.open("a") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def copy_template(root: Path, force: bool = False) -> None:
+    if not TEMPLATE.exists():
+        raise SystemExit(f"template not found: {TEMPLATE}")
+    for source in TEMPLATE.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(TEMPLATE)
+        destination = root / relative
+        if destination.exists() and not force:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    sample = root / ".agent" / "project.example.json"
+    if sample.exists():
+        sample.unlink()
+
+
+def copy_subagent_state(root: Path, session_file: Path, session_id: str, day_dir: Path) -> None:
+    """Copy the current session's child runs and subagent artifacts into the day archive."""
+    session_root = session_dir(root)
+
+    # pi-subagents stores child run directories under <sessionDir>/<parent-session-stem>/.
+    child_dir = session_root / session_file.stem
+    if child_dir.is_dir():
+        shutil.copytree(child_dir, day_dir / "subagent-sessions", dirs_exist_ok=True)
+
+    # It also writes per-run artifacts under <sessionDir>/subagent-artifacts/.
+    artifacts = session_root / "subagent-artifacts"
+    if artifacts.is_dir():
+        dest = day_dir / "subagent-artifacts"
+        dest.mkdir(parents=True, exist_ok=True)
+        for meta in artifacts.glob("*_meta.json"):
+            try:
+                data = json.loads(meta.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("parentSessionId") != session_id:
+                continue
+            run_id = data.get("runId")
+            if not run_id:
+                continue
+            for source in artifacts.glob(f"{run_id}_*"):
+                if source.is_file():
+                    shutil.copy2(source, dest / source.name)
+
+    # pi-interactive-subagents-style artifacts, when present.
+    interactive_dir = session_root / "artifacts" / session_id
+    if interactive_dir.is_dir():
+        shutil.copytree(interactive_dir, day_dir / "artifacts", dirs_exist_ok=True)
+
+
+def continuum_package_installed() -> bool:
+    agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", HOME / ".pi" / "agent"))
+    candidates = [
+        agent_dir / "npm" / "node_modules" / "pi-continuum",
+        HOME / ".pi" / "agent" / "npm" / "node_modules" / "pi-continuum",
+    ]
+    return any(path.exists() for path in candidates)
+
+
+def copy_runtime_extension(root: Path, force: bool = False) -> None:
+    """Install the packaged Continuum extension into a project."""
+    package_root = Path(__file__).resolve().parent.parent
+    source = package_root / "extensions" / "continuum.ts"
+    destination = root / ".pi" / "extensions" / "continuum.ts"
+    if not source.exists():
+        raise SystemExit(f"packaged extension missing: {source}")
+    if destination.exists() and not force:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    registry = load_registry()
+    if name in registry and not args.force:
+        raise SystemExit(f"project already exists: {name} (use --force to overwrite metadata)")
+
+    repo = Path(args.repo).expanduser().resolve()
+    if not repo.exists():
+        raise SystemExit(f"repository does not exist: {repo}")
+    if not repo.is_dir():
+        raise SystemExit(f"not a directory: {repo}")
+
+    (repo / ".agent" / "sessions" / "days").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "artifacts").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "locks").mkdir(parents=True, exist_ok=True)
+    copy_template(repo, force=args.force)
+    if args.local_extension or (not args.no_local_extension and not continuum_package_installed()):
+        copy_runtime_extension(repo, force=args.force)
+
+    project = {
+        "name": name,
+        "repo": str(repo),
+        "created_at": utc_now(),
+        "timezone": "UTC",
+        "model": args.model,
+        "thinking": args.thinking,
+        "verifier_model": args.verifier_model,
+        "clm": {
+            "budget": 262144,
+            "reserve": 32768,
+            "cap": "10000:0.5",
+            "trailer": True,
+            "one_tool": False,
+        },
+        "rollover": {
+            "mode": args.rollover,
+            "fallback": "snapshot",
+            "at": "00:00Z",
+        },
+        "tmux": {"session": f"pi-{name}"},
+        "backup": {"mode": "none"},
+    }
+    write_atomic(repo / ".agent" / "project.json", json.dumps(project, indent=2) + "\n")
+
+    registry[name] = {"repo": str(repo), "created_at": project["created_at"]}
+    save_registry(registry)
+
+    linked = False
+    if not args.no_link:
+        bin_dir = HOME / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        link = bin_dir / name
+        target = Path(__file__).resolve()
+        if link.exists() or link.is_symlink():
+            if link.is_symlink() and link.resolve() == target:
+                linked = True
+            elif args.force:
+                link.unlink()
+                link.symlink_to(target)
+                linked = True
+            else:
+                print(f"warning: {link} exists; not replacing it", file=sys.stderr)
+        else:
+            link.symlink_to(target)
+            linked = True
+
+    print(f"created project {name}")
+    print(f"  repo:    {repo}")
+    print(f"  state:   {repo / '.agent'}")
+    print(f"  config:  {repo / '.pi'}")
+    print(f"  wrapper: {HOME / '.local' / 'bin' / name if linked else '(not linked)'}")
+    print()
+    print("Next: review .pi/settings.json, then run:")
+    print(f"  {name}" if linked else f"  continuum open {name}")
+    return 0
+
+
+def tmux_available() -> bool:
+    return shutil.which("tmux") is not None
+
+
+def tmux_has(session: str) -> bool:
+    if not tmux_available():
+        return False
+    return subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def attach_tmux(session: str) -> None:
+    if os.environ.get("TMUX"):
+        result = subprocess.run(["tmux", "switch-client", "-t", session])
+        if result.returncode != 0:
+            print(f"tmux session {session} is running; attach with: tmux attach -t {session}")
+        return
+    os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+
+
+def active_session(root: Path) -> dict | None:
+    return read_json(root / ".agent" / "active.json", None)
+
+
+def session_dir(root: Path) -> Path:
+    return root / ".agent" / "sessions"
+
+
+def pi_binary() -> str:
+    return os.environ.get("PI_BIN", "pi")
+
+
+def clm_env(root: Path, project: dict) -> dict:
+    clm = project.get("clm", {})
+    env = os.environ.copy()
+    env["PI_CLM_BUDGET"] = str(clm.get("budget", 262144))
+    env["PI_CLM_RESERVE"] = str(clm.get("reserve", 32768))
+    env["PI_CLM_OBSERVATION_CAP"] = str(clm.get("cap", "10000:0.5"))
+    if clm.get("trailer", True):
+        env["PI_CLM_SIZE_TRAILER"] = "1"
+    if clm.get("one_tool", False):
+        env["PI_CLM_ONE_TOOL_PER_TURN"] = "1"
+    env["PI_CLM_STEERING"] = str(root / "CLM_STEERING.md")
+    env["PI_PROJECT_NAME"] = project["name"]
+    env["PI_PROJECT_ROOT"] = str(root)
+    return env
+
+
+def launch_command(
+    root: Path,
+    project: dict,
+    session_id: str,
+    fork_from: Path | None = None,
+) -> list[str]:
+    cmd = [
+        pi_binary(),
+        "--session-id",
+        session_id,
+        "--session-dir",
+        str(session_dir(root)),
+        "--name",
+        f"{project['name']} {utc_day()}",
+        "--model",
+        project.get("model", DEFAULT_MODEL),
+        "--thinking",
+        project.get("thinking", "high"),
+    ]
+    if fork_from is not None:
+        cmd[1:1] = ["--fork", str(fork_from)]
+    return cmd
+
+
+def start_in_tmux(root: Path, project: dict, cmd: list[str]) -> None:
+    session = project.get("tmux", {}).get("session", f"pi-{project['name']}")
+    env = clm_env(root, project)
+    command = " ".join(shlex.quote(part) for part in cmd)
+
+    # Creating a session from inside tmux is rejected unless $TMUX is removed
+    # from the child environment. Create it detached, then switch this client.
+    if os.environ.get("TMUX"):
+        tmux_env = env.copy()
+        tmux_env.pop("TMUX", None)
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session, "-c", str(root), command],
+            env=tmux_env,
+            check=True,
+        )
+        result = subprocess.run(["tmux", "switch-client", "-t", session], env=env)
+        if result.returncode != 0:
+            print(f"tmux session {session} created; attach with: tmux attach -t {session}")
+        return
+
+    tmux_cmd = [
+        "tmux",
+        "new-session",
+        "-A",
+        "-s",
+        session,
+        "-c",
+        str(root),
+        command,
+    ]
+    os.execvpe("tmux", tmux_cmd, env)
+
+def quick_preflight(root: Path, project: dict, require_tmux: bool = False) -> bool:
+    problems = []
+    if not root.exists():
+        problems.append(f"repo missing: {root}")
+    if not (root / ".agent" / "project.json").exists():
+        problems.append(f"missing project config: {root / '.agent' / 'project.json'}")
+    if require_tmux and not tmux_available():
+        problems.append("tmux is not installed; interactive subagents need tmux")
+    active = active_session(root)
+    if active:
+        session_file = Path(active.get("session_file", "")).expanduser()
+        if not session_file.exists():
+            problems.append(f"active session file missing: {session_file}")
+    if problems:
+        for problem in problems:
+            print(f"preflight: {problem}", file=sys.stderr)
+        print("run `continuum doctor` for details", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None) or {}
+    active = active_session(root)
+    failures = 0
+
+    def check(label: str, ok: bool, detail: str = "", required: bool = True) -> None:
+        nonlocal failures
+        status = "PASS" if ok else ("FAIL" if required else "WARN")
+        print(f"{status:4} {label}" + (f": {detail}" if detail else ""))
+        if not ok and required:
+            failures += 1
+
+    check("repo exists", root.exists(), str(root))
+    check("project config", (root / ".agent" / "project.json").exists(), str(root / ".agent" / "project.json"))
+    check("Pi config", (root / ".pi" / "settings.json").exists(), str(root / ".pi" / "settings.json"))
+    local_extension = root / ".pi" / "extensions" / "continuum.ts"
+    check(
+        "Continuum extension",
+        local_extension.exists() or continuum_package_installed(),
+        str(local_extension) if local_extension.exists() else "global pi-continuum package",
+    )
+    check("CLM steering", (root / "CLM_STEERING.md").exists(), str(root / "CLM_STEERING.md"))
+    check("task template", (root / "TASK.md").exists(), str(root / "TASK.md"))
+    check("pi binary", shutil.which(pi_binary()) is not None, pi_binary())
+    check("tmux", tmux_available(), "required for interactive subagents", required=False)
+
+    if active:
+        session_file = Path(active.get("session_file", "")).expanduser()
+        check("active session file", session_file.exists(), str(session_file))
+
+    # Package declarations are a stronger signal than guessing install paths.
+    settings = read_json(root / ".pi" / "settings.json", {}) or {}
+    packages = settings.get("packages", [])
+    declared = "\n".join(str(item) for item in packages)
+    check("pi-clm declared", "pi-clm" in declared, "npm:@lolipopshock/pi-clm")
+    check("pi-subagents declared", "pi-subagents" in declared, "npm:pi-subagents")
+
+    # Model auth: do not print secrets; just check common sources.
+    auth = read_json(HOME / ".pi" / "agent" / "auth.json", {}) or {}
+    has_key = bool(os.environ.get("DEEPSEEK_API_KEY")) or "deepseek" in auth
+    check("DeepSeek auth", has_key, "set DEEPSEEK_API_KEY or use /login deepseek", required=False)
+
+    check("rollover mode", project.get("rollover", {}).get("mode") in {"snapshot", "fork"}, project.get("rollover", {}).get("mode", "missing"))
+    print()
+    if failures:
+        print(f"{failures} required check(s) failed")
+        return 1
+    print("ready")
+    return 0
+
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None)
+    if not project:
+        raise SystemExit(f"missing {root / '.agent' / 'project.json'}")
+
+    if not args.no_preflight and not quick_preflight(root, project):
+        return 2
+
+    session = project.get("tmux", {}).get("session", f"pi-{name}")
+    if tmux_has(session):
+        attach_tmux(session)
+        return 0
+
+    use_tmux = tmux_available() and not args.no_tmux
+    if not tmux_available():
+        print("warning: tmux not found; running directly without attach/resume support", file=sys.stderr)
+    elif args.no_tmux:
+        print("warning: --no-tmux; running directly without attach/resume support", file=sys.stderr)
+
+    active = active_session(root)
+    today = utc_day()
+    fork_from: Path | None = None
+    session_id = f"{name}-{today.replace('-', '')}"
+
+    if active:
+        session_file = Path(active.get("session_file", "")).expanduser()
+        active_day = active.get("utc_day")
+        session_id = active.get("session_id") or session_id
+        if active_day and active_day != today:
+            print(f"UTC day changed: {active_day} -> {today}; sealing {active_day}")
+            seal_project(name, quiet=True)
+            if project.get("rollover", {}).get("mode", "snapshot") == "fork" and session_file.exists():
+                fork_from = session_file
+                session_id = f"{name}-{today.replace('-', '')}"
+        elif session_file.exists():
+            session_id = active.get("session_id") or session_id
+
+    cmd = launch_command(root, project, session_id, fork_from=fork_from)
+    print(f"opening {name} ({today})")
+    print(f"  repo:    {root}")
+    print(f"  session: {session_id}")
+    if fork_from:
+        print(f"  fork:    {fork_from}")
+
+    if args.dry_run:
+        print("dry-run command:")
+        print("  " + " ".join(shlex.quote(part) for part in cmd))
+        env = clm_env(root, project)
+        for key in (
+            "PI_CLM_BUDGET",
+            "PI_CLM_RESERVE",
+            "PI_CLM_OBSERVATION_CAP",
+            "PI_CLM_SIZE_TRAILER",
+            "PI_CLM_STEERING",
+        ):
+            print(f"  {key}={env.get(key)}")
+        return 0
+
+    if not use_tmux:
+        env = clm_env(root, project)
+        os.chdir(root)
+        os.execvpe(cmd[0], cmd, env)
+        return 0
+
+    start_in_tmux(root, project, cmd)
+    return 0
+
+
+def seal_project(name: str, quiet: bool = False) -> int:
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None)
+    if not project:
+        raise SystemExit(f"missing project config for {name}")
+    active = active_session(root)
+    if not active:
+        if not quiet:
+            print("no active session to seal")
+        return 0
+
+    day = active.get("utc_day") or utc_day()
+    session_id = active.get("session_id") or "unknown"
+    day_dir = root / ".agent" / "sessions" / "days" / day / session_id
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_path = root / ".agent" / "locks" / "seal.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        session_file = Path(active["session_file"]).expanduser()
+        if not session_file.exists():
+            raise SystemExit(f"session file missing: {session_file}")
+
+        complete = read_complete_jsonl(session_file)
+        snapshot_file = day_dir / "session.jsonl"
+        snapshot_file.write_text(complete)
+        digest = hashlib.sha256(complete.encode()).hexdigest()
+
+        copy_subagent_state(root, session_file, session_id, day_dir)
+
+        for name_file in (
+            "TASK.md",
+            "PLAN.md",
+            "VERDICT.json",
+            "HANDOFF.md",
+            "diff.patch",
+            "tests.log",
+        ):
+            source = root / name_file
+            if source.exists():
+                shutil.copy2(source, day_dir / name_file)
+
+        previous_seal = None
+        seal_path = day_dir / "seal.json"
+        if seal_path.exists():
+            try:
+                previous_seal = json.loads(seal_path.read_text()).get("seal")
+            except json.JSONDecodeError:
+                previous_seal = None
+
+        manifest = {
+            "project": name,
+            "day": day,
+            "session_id": session_id,
+            "session_file": str(session_file),
+            "leaf_id": active.get("leaf_id"),
+            "snapshot_at": utc_now(),
+            "reason": "manual-seal",
+            "model": active.get("model"),
+            "bytes": snapshot_file.stat().st_size,
+            "sha256": digest,
+        }
+        write_atomic(day_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+        seal = {
+            **manifest,
+            "previous_seal": previous_seal,
+            "seal": hashlib.sha256(
+                f"{previous_seal or ''}\n{digest}\n{manifest['snapshot_at']}".encode()
+            ).hexdigest(),
+        }
+        write_atomic(seal_path, json.dumps(seal, indent=2) + "\n")
+        append_ledger(root, "day_seal", day=day, session_id=session_id, reason="manual-seal", sha256=digest)
+
+    if not quiet:
+        print(f"sealed {name} / {day}")
+        print(f"  snapshot: {day_dir / 'session.jsonl'}")
+        print(f"  sha256:   {digest}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None) or {}
+    active = active_session(root)
+    session = project.get("tmux", {}).get("session", f"pi-{name}")
+    ledger_path = root / ".agent" / "ledger.ndjson"
+    last_event = None
+    if ledger_path.exists():
+        lines = ledger_path.read_text().splitlines()
+        if lines:
+            try:
+                last_event = json.loads(lines[-1])
+            except json.JSONDecodeError:
+                last_event = None
+
+    print(f"project:  {name}")
+    print(f"repo:     {root}")
+    print(f"model:    {project.get('model', DEFAULT_MODEL)}")
+    print(f"verifier: {project.get('verifier_model', DEFAULT_VERIFIER)}")
+    print(f"rollover: {project.get('rollover', {}).get('mode', 'snapshot')}")
+    print(f"tmux:     {'running' if tmux_has(session) else 'stopped'} ({session})")
+    print(f"utc day:  {utc_day()}")
+    if active:
+        print(f"active:   {active.get('utc_day')} / {active.get('session_id')}")
+        print(f"session:  {active.get('session_file')}")
+    else:
+        print("active:   (none)")
+    if last_event:
+        print(f"last:     {last_event.get('ts')} {last_event.get('event')}")
+    return 0
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    registry = load_registry()
+    if not registry:
+        print("no projects")
+        return 0
+    for name, entry in sorted(registry.items()):
+        print(f"{name}\t{entry.get('repo')}")
+    return 0
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    print(project_dir(safe_name(args.name)))
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None) or {}
+    backup = project.get("backup", {}) or {}
+    command = args.command or backup.get("command")
+    if not command:
+        print("backup is not configured.")
+        print("Set .agent/project.json backup.command, for example:")
+        print('  "backup": {"mode": "command", "command": "restic backup \"$CONTINUUM_STATE\""}')
+        print("Then run: continuum backup <name>")
+        return 2
+    env = os.environ.copy()
+    env["CONTINUUM_PROJECT"] = name
+    env["CONTINUUM_REPO"] = str(root)
+    env["CONTINUUM_STATE"] = str(root / ".agent")
+    print(f"backing up {name}")
+    result = subprocess.run(command, shell=True, cwd=root, env=env)
+    append_ledger(root, "backup", command=command, exit_code=result.returncode)
+    if result.returncode != 0:
+        print(f"backup failed with exit code {result.returncode}", file=sys.stderr)
+    return result.returncode
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = Path(args.root).expanduser().resolve() if getattr(args, "root", None) else project_dir(name)
+    days = root / ".agent" / "sessions" / "days"
+    if not days.exists():
+        print("no day archives")
+        return 0
+    failures = 0
+    manifests = sorted(days.glob("*/manifest.json")) + sorted(days.glob("*/*/manifest.json"))
+    for manifest_path in manifests:
+        manifest = read_json(manifest_path, {})
+        session_file = manifest_path.parent / "session.jsonl"
+        if not session_file.exists():
+            print(f"FAIL {manifest_path.parent.name}: missing session.jsonl")
+            failures += 1
+            continue
+        digest = sha256_file(session_file)
+        expected = manifest.get("sha256")
+        if digest != expected:
+            print(f"FAIL {manifest_path.parent.name}: hash mismatch")
+            failures += 1
+            continue
+        seal_path = manifest_path.parent / "seal.json"
+        if seal_path.exists():
+            seal = read_json(seal_path, {})
+            expected_seal = hashlib.sha256(
+                f"{seal.get('previous_seal') or ''}\n{manifest.get('sha256')}\n{manifest.get('snapshot_at')}".encode()
+            ).hexdigest()
+            if seal.get("seal") != expected_seal:
+                print(f"FAIL {manifest_path.parent.name}: seal chain mismatch")
+                failures += 1
+                continue
+        print(f"PASS {manifest_path.parent.name}: {digest[:12]}…")
+    return 1 if failures else 0
+
+
+def cmd_fork_day(args: argparse.Namespace) -> int:
+    name = safe_name(args.name)
+    root = project_dir(name)
+    project = read_json(root / ".agent" / "project.json", None)
+    if not project:
+        raise SystemExit(f"missing project config for {name}")
+    if not args.no_preflight and not quick_preflight(root, project):
+        return 2
+    session = project.get("tmux", {}).get("session", f"pi-{name}")
+    if tmux_has(session):
+        raise SystemExit(f"{session} is running; exit it before forking the day")
+    seal_project(name, quiet=True)
+    active = active_session(root)
+    if not active:
+        print("no active session; nothing to fork")
+        return 0
+    old = Path(active["session_file"]).expanduser()
+    new_id = f"{name}-{utc_day().replace('-', '')}"
+    cmd = launch_command(root, project, new_id, fork_from=old if old.exists() else None)
+    print(f"forking {name} -> {new_id}")
+    if args.dry_run:
+        print("dry-run command:")
+        print("  " + " ".join(shlex.quote(part) for part in cmd))
+        return 0
+    if not tmux_available() or args.no_tmux:
+        env = clm_env(root, project)
+        os.chdir(root)
+        os.execvpe(cmd[0], cmd, env)
+        return 0
+    start_in_tmux(root, project, cmd)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="continuum",
+        description="Continuum — project runtime for Pi + CLM",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    new = sub.add_parser("new", help="create a project template in a repository")
+    new.add_argument("name")
+    new.add_argument("--repo", required=True)
+    new.add_argument("--model", default=DEFAULT_MODEL)
+    new.add_argument("--thinking", default="high")
+    new.add_argument("--verifier-model", default=DEFAULT_VERIFIER)
+    new.add_argument("--rollover", choices=["fork", "snapshot"], default="snapshot")
+    new.add_argument("--no-link", action="store_true", help="do not create ~/.local/bin/<name>")
+    new.add_argument("--no-local-extension", action="store_true", help="use the globally installed Pi package extension instead of copying it")
+    new.add_argument("--local-extension", action="store_true", help="force copying the extension into this project")
+    new.add_argument("--force", action="store_true")
+    new.set_defaults(func=cmd_new)
+
+    open_cmd = sub.add_parser("open", help="resume or attach to a project")
+    open_cmd.add_argument("name")
+    open_cmd.add_argument("--no-tmux", action="store_true")
+    open_cmd.add_argument("--dry-run", action="store_true")
+    open_cmd.add_argument("--no-preflight", action="store_true")
+    open_cmd.set_defaults(func=cmd_open)
+
+    seal = sub.add_parser("seal", help="snapshot the active session into its UTC day folder")
+    seal.add_argument("name")
+    seal.set_defaults(func=lambda a: seal_project(safe_name(a.name)))
+
+    status = sub.add_parser("status")
+    status.add_argument("name")
+    status.set_defaults(func=cmd_status)
+
+    list_cmd = sub.add_parser("list")
+    list_cmd.set_defaults(func=cmd_list)
+
+    path = sub.add_parser("path")
+    path.add_argument("name")
+    path.set_defaults(func=cmd_path)
+
+    verify = sub.add_parser("verify")
+    verify.add_argument("name")
+    verify.add_argument("--root", help="verify a restored project root instead of the registered repo")
+    verify.set_defaults(func=cmd_verify)
+
+    backup = sub.add_parser("backup", help="run the project's configured backup command")
+    backup.add_argument("name")
+    backup.add_argument("--command", help="override the configured backup command")
+    backup.set_defaults(func=cmd_backup)
+
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("name")
+    doctor.set_defaults(func=cmd_doctor)
+
+    fork = sub.add_parser("fork-day")
+    fork.add_argument("name")
+    fork.add_argument("--no-tmux", action="store_true")
+    fork.add_argument("--dry-run", action="store_true")
+    fork.add_argument("--no-preflight", action="store_true")
+    fork.set_defaults(func=cmd_fork_day)
+
+    return parser
+
+
+def main() -> int:
+    invoked = Path(sys.argv[0]).name
+    if invoked not in {"pi-project", "pi-project.py", "continuum"} and len(sys.argv) == 1:
+        return cmd_open(argparse.Namespace(name=invoked, no_tmux=False, dry_run=False))
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

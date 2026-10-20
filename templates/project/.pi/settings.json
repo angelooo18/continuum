@@ -1,0 +1,15 @@
+{
+  "$schema": "https://pi.dev/schemas/settings.schema.json",
+  "sessionDir": ".agent/sessions",
+  "packages": [
+    "npm:@lolipopshock/pi-clm@1.0.0",
+    "npm:pi-subagents@0.79.1"
+  ],
+  "defaultTools": [
+    "+codemode"
+  ],
+  "subagents": {
+    "defaultModel": "deepseek/deepseek-flash",
+    "defaultThinking": "high"
+  }
+}

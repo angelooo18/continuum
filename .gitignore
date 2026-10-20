@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+__pycache__/
+*.pyc
+*.tgz
+.agent/
+*.jsonl
+auth.json
+.env
+.env.*

@@ -1,0 +1,65 @@
+{
+  "name": "pi-continuum",
+  "version": "0.1.0",
+  "description": "Continuum: project runtime for Pi with CLM, subagents, UTC session archives, and verification gates.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Continuum contributors",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "continuum",
+    "coding-agent",
+    "clm",
+    "subagents"
+  ],
+  "bin": {
+    "continuum": "./bin/continuum"
+  },
+  "files": [
+    "bin",
+    "extensions",
+    "templates",
+    "examples",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/continuum.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "make test"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  }
+}
