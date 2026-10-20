@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-10-20
+
+- Add `RESEARCH.md` with citations and the design decisions they informed.
+- Include research and credits in the package and README.
+
 ## 0.1.3 — 2026-10-20
 
 - Add `CREDITS.md` with upstream extension/project citations.

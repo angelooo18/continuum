@@ -34,6 +34,10 @@ Continuum is a composition layer. It does not vendor the upstream packages below
 - Role: instant attach/resume and single-writer project sessions.
 - Continuum usage: optional. Without tmux, `continuum open` runs Pi directly.
 
+## Research
+
+See [RESEARCH.md](./RESEARCH.md) for the full research notes and citations.
+
 ## Research references
 
 Continuum’s subagent policy is informed by:
