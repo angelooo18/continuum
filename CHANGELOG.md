@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7 — 2026-10-20
+
+- Remove Continuum npm packaging/publishing instructions.
+- Install the CLI from GitHub with `./install.sh`.
+- Keep only the minimal `package.json` needed for Pi package/Git installation.
+- Replace npm-package uninstall steps with `./uninstall.sh` and `pi remove git:...`.
+- Remove historical design/packaging docs from the public repo.
+
 ## 0.1.6 — 2026-10-20
 
 - Add `docs/CLM-DEEPSEEK.md` with everyday-high and hard-max CLM profiles.

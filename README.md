@@ -19,32 +19,29 @@ It is packaged as a Pi package plus a thin `continuum` launcher.
 - `tmux` recommended for instant attach/resume; without it, Continuum runs Pi directly
 - A model provider configured in Pi (for example DeepSeek via `/login deepseek`)
 
-Continuum 0.1.6 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
+Continuum 0.1.7 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
 
 ## Install
 
-### From a local checkout
+### From GitHub
 
 ```bash
-git clone <your-repo> continuum
+git clone https://github.com/angelooo18/continuum.git
 cd continuum
-npm install -g .
+./install.sh
 continuum --help
 ```
 
-### From npm, once published
-
-```bash
-npm install -g pi-continuum@0.1.6
-continuum --help
-```
+`install.sh` symlinks `bin/continuum` into a user bin directory already on `PATH`.
 
 ### Pi package resources
 
-`pi-continuum` also ships the Continuum extension as a Pi package resource. Core agents and skills are installed into each project by `continuum new`.
+The repo also exposes the Continuum extension as a Pi package resource. Core agents and skills are installed into each project by `continuum new`.
+
+Optional global Pi package install from Git:
 
 ```bash
-pi install npm:pi-continuum@0.1.6
+pi install git:github.com/angelooo18/continuum@v0.1.7
 ```
 
 If you install the Pi package globally, create projects with:
@@ -54,12 +51,6 @@ continuum new acme --repo ~/src/acme --no-local-extension
 ```
 
 Otherwise, `continuum new` copies the extension into the project and does not require the global Pi package. This avoids loading the same extension twice.
-
-For local development:
-
-```bash
-pi install /path/to/continuum
-```
 
 ## What gets installed
 
@@ -267,9 +258,15 @@ Read [SECURITY.md](./SECURITY.md).
 ## Uninstall
 
 ```bash
-pi remove npm:pi-continuum
-npm uninstall -g pi-continuum
-rm ~/.local/bin/<project>       # generated wrapper
+./uninstall.sh
+pi remove git:github.com/angelooo18/continuum
+```
+
+Remove generated project wrappers individually if needed:
+
+```bash
+rm ~/.local/bin/<project>
+rm ~/.pi/agent/bin/<project>
 ```
 
 Project runtime state lives in each repo’s `.agent/` directory. Remove it only after archiving what you need.
@@ -284,7 +281,7 @@ The smoke test creates a temporary project, seals a synthetic session, verifies 
 
 See:
 
-- [docs/design/DRAFT.md](docs/design/DRAFT.md) — architecture
-- [docs/design/LIVE-TEST-REPORT.md](docs/design/LIVE-TEST-REPORT.md) — live test results
-- [docs/design/TEST-PLAN.md](docs/design/TEST-PLAN.md) — full test matrix
-- [docs/design/PACKAGING.md](docs/design/PACKAGING.md) — packaging notes
+- [docs/CLM-DEEPSEEK.md](docs/CLM-DEEPSEEK.md) — DeepSeek CLM profiles
+- [docs/BACKUP.md](docs/BACKUP.md) — backup and restore
+- [RESEARCH.md](RESEARCH.md) — research citations
+- [CREDITS.md](CREDITS.md) — upstream projects
