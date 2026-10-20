@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 — 2026-10-20
+
+- Document exactly which upstream packages are installed.
+- Document duplicate-extension/package behavior.
+- Add manual pinned install commands for `pi-clm` and `pi-subagents`.
+
 ## 0.1.4 — 2026-10-20
 
 - Add `RESEARCH.md` with citations and the design decisions they informed.

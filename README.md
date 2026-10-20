@@ -19,7 +19,7 @@ It is packaged as a Pi package plus a thin `continuum` launcher.
 - `tmux` recommended for instant attach/resume; without it, Continuum runs Pi directly
 - A model provider configured in Pi (for example DeepSeek via `/login deepseek`)
 
-Continuum 0.1.4 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
+Continuum 0.1.5 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
 
 ## Install
 
@@ -35,7 +35,7 @@ continuum --help
 ### From npm, once published
 
 ```bash
-npm install -g pi-continuum@0.1.4
+npm install -g pi-continuum@0.1.5
 continuum --help
 ```
 
@@ -44,7 +44,7 @@ continuum --help
 `pi-continuum` also ships the Continuum extension as a Pi package resource. Core agents and skills are installed into each project by `continuum new`.
 
 ```bash
-pi install npm:pi-continuum@0.1.4
+pi install npm:pi-continuum@0.1.5
 ```
 
 If you install the Pi package globally, create projects with:
@@ -60,6 +60,47 @@ For local development:
 ```bash
 pi install /path/to/continuum
 ```
+
+## What gets installed
+
+`pi-continuum` itself contains:
+
+- the Continuum extension,
+- project templates,
+- core agents,
+- the verification skill.
+
+It does **not** vendor `pi-clm` or `pi-subagents`. They remain separate upstream packages.
+
+`continuum new` writes this into the project’s `.pi/settings.json`:
+
+```json
+{
+  "packages": [
+    "npm:@lolipopshock/pi-clm@1.0.0",
+    "npm:pi-subagents@0.79.1"
+  ]
+}
+```
+
+Pi installs those pinned packages into the project’s `.pi/npm/` directory on the first trusted run. To preinstall them manually:
+
+```bash
+pi install npm:@lolipopshock/pi-clm@1.0.0
+pi install npm:pi-subagents@0.79.1
+```
+
+Optional, only when using the researcher example:
+
+```bash
+pi install npm:pi-web-access@0.42.0
+```
+
+### Avoid duplicates
+
+- The **Continuum extension** is copied into each project by default. If you also install `pi-continuum` globally as a Pi package, create projects with `continuum new ... --no-local-extension` so it is not loaded twice.
+- `pi-clm` and `pi-subagents` are declared once, in the project settings. If you also install them globally, Pi treats the project entry as the project-scoped replacement for the same package identity; keep versions pinned and avoid mixing incompatible versions.
+- Do not run `pi-observational-memory` alongside `pi-clm`; both manage compaction.
 
 ## Quick start
 
