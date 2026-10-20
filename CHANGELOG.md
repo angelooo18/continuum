@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6 — 2026-10-20
+
+- Add `docs/CLM-DEEPSEEK.md` with everyday-high and hard-max CLM profiles.
+- Link the DeepSeek profiles from the README and research notes.
+
 ## 0.1.5 — 2026-10-20
 
 - Document exactly which upstream packages are installed.

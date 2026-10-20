@@ -36,7 +36,7 @@ Continuum is a composition layer. It does not vendor the upstream packages below
 
 ## Research
 
-See [RESEARCH.md](./RESEARCH.md) for the full research notes and citations.
+See [RESEARCH.md](./RESEARCH.md) for the full research notes and citations. DeepSeek-specific CLM profiles are in [docs/CLM-DEEPSEEK.md](./docs/CLM-DEEPSEEK.md).
 
 ## Research references
 

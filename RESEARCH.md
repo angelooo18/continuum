@@ -21,7 +21,7 @@ The paper treats context as a file the model can edit, rather than an append-onl
 - 24-hour multi-repository agent swarm: 65% greater downstream speedup at the same compute.
 - Natural-language steering and evolved context-management skills improved held-out accuracy by up to 35.9 points.
 
-Continuum uses that idea through `pi-clm`, with a 256K budget, 32K reserve, a 10K observation cap, a context-size trailer, and a project-specific `CLM_STEERING.md`.
+Continuum uses that idea through `pi-clm`. The generic template uses a 256K budget and 32K reserve; DeepSeek-specific starting points are documented in [docs/CLM-DEEPSEEK.md](./CLM-DEEPSEEK.md), including a 272K/64K high-effort profile and a 384K/128K max-effort profile.
 
 ### Contextual Agentic Memory is a Memo, Not True Memory
 

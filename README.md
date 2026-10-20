@@ -19,7 +19,7 @@ It is packaged as a Pi package plus a thin `continuum` launcher.
 - `tmux` recommended for instant attach/resume; without it, Continuum runs Pi directly
 - A model provider configured in Pi (for example DeepSeek via `/login deepseek`)
 
-Continuum 0.1.5 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
+Continuum 0.1.6 is tested on Linux/macOS. Native Windows is not supported because the launcher uses POSIX locking and tmux.
 
 ## Install
 
@@ -35,7 +35,7 @@ continuum --help
 ### From npm, once published
 
 ```bash
-npm install -g pi-continuum@0.1.5
+npm install -g pi-continuum@0.1.6
 continuum --help
 ```
 
@@ -44,7 +44,7 @@ continuum --help
 `pi-continuum` also ships the Continuum extension as a Pi package resource. Core agents and skills are installed into each project by `continuum new`.
 
 ```bash
-pi install npm:pi-continuum@0.1.5
+pi install npm:pi-continuum@0.1.6
 ```
 
 If you install the Pi package globally, create projects with:
@@ -249,7 +249,7 @@ See [docs/BACKUP.md](docs/BACKUP.md) for restic/rclone examples and the restore 
 
 ## Research
 
-Continuum’s defaults are informed by CLM, multi-agent orchestration, verification, and harness-engineering research. See [RESEARCH.md](./RESEARCH.md) for paper citations, reported results, and the evidence caveats.
+Continuum’s defaults are informed by CLM, multi-agent orchestration, verification, and harness-engineering research. See [RESEARCH.md](./RESEARCH.md) for paper citations, reported results, and the evidence caveats. DeepSeek-specific CLM profiles are in [docs/CLM-DEEPSEEK.md](docs/CLM-DEEPSEEK.md).
 
 ## Credits
 
