@@ -10,7 +10,13 @@ Copy `agents/researcher.md` into `.pi/agents/` when you want a project-specific 
 pi install npm:pi-web-access
 ```
 
-The `pi-subagents` built-in `researcher` is also available; this file is for customization.
+The base template sets `subagents.defaultExtensions: []` so a new agent cannot
+accidentally load `pi-clm` or the Continuum ledger. That also disables ambient
+extension discovery for agents without an `extensions` field. If you use this
+researcher, add the installed `pi-web-access` extension path explicitly to its
+`extensions` frontmatter, or remove the project default and audit every agent.
+The `pi-subagents` built-in `researcher` is also available; this file is for
+customization.
 
 ## Diagrammer
 

@@ -5,8 +5,9 @@ model: deepseek/deepseek-flash
 thinking: high
 tools: read, grep, find, ls, bash
 systemPromptMode: append
+extensions:
 skills: verification
-async: true
+async: false
 acceptanceRole: read-only
 advertise: true
 ---
@@ -21,11 +22,26 @@ Required checks:
 2. Inspect the diff and the changed files.
 3. Run the relevant tests, lint, typecheck, and build commands.
 4. Check for regressions, missing edge cases, and unrelated changes.
-5. Write `VERDICT.json` with:
-   - overall `PASS` or `FAIL`,
-   - one entry per acceptance check with evidence,
-   - exact commands and results,
-   - residual risks,
-   - unresolved items.
+5. Write `VERDICT.json` with the bash tool (for example a heredoc); do not
+   edit source files. Use this shape:
 
-If you cannot verify a check, mark it `UNVERIFIED`, not `PASS`. If any required check fails, the overall verdict is `FAIL`.
+```json
+{
+  "status": "PASS",
+  "checks": [
+    {
+      "id": "AC-1",
+      "status": "PASS",
+      "evidence": "exact command, result, and file:line"
+    }
+  ],
+  "residual_risks": []
+}
+```
+
+One `checks` entry is required for every `AC-*` item in `TASK.md`.
+If you cannot verify a check, mark it `UNVERIFIED`, not `PASS`. If any
+required check fails, the overall verdict is `FAIL`.
+
+6. Run `continuum check <project>` and report its result. Do not declare the
+   task done if `continuum check` fails.

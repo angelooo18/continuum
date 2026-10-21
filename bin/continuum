@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Continuum — draft prototype
+Continuum — project launcher
 
 Bind a repository to a project name, resume its Pi session, and keep
 UTC-traceable day snapshots under .agent/.
 
 This is intentionally conservative and dependency-free. It does not install
-packages or start Pi during `new`. It is meant for review before hardening.
+packages or start Pi during `new`.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,38 @@ REGISTRY = HOME / ".pi" / "projects" / "registry.json"
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "project"
 DEFAULT_MODEL = "deepseek/deepseek-flash"
 DEFAULT_VERIFIER = "deepseek/deepseek-flash"
+REQUIRED_PACKAGES = (
+    "npm:@lolipopshock/pi-clm@1.0.0",
+    "npm:pi-subagents@0.79.1",
+)
+RESERVED_WRAPPER_NAMES = {
+    "bash",
+    "continuum",
+    "fish",
+    "git",
+    "node",
+    "npm",
+    "npx",
+    "pi",
+    "pi-project",
+    "pi-project.py",
+    "python",
+    "python3",
+    "sh",
+    "sudo",
+    "tmux",
+    "zsh",
+}
+EVIDENCE_FILES = (
+    "TASK.md",
+    "PLAN.md",
+    "VERDICT.json",
+    "HANDOFF.md",
+    "diff.patch",
+    "tests.log",
+)
+REQUIRED_EVIDENCE = ("TASK.md", "PLAN.md")
+MERGE_TEMPLATE_FILES = {Path(".gitignore"), Path(".pi/settings.json")}
 
 
 def utc_now() -> str:
@@ -57,11 +90,35 @@ def load_registry() -> dict:
         raise SystemExit(f"invalid registry {REGISTRY}: {exc}") from exc
 
 
-def save_registry(registry: dict) -> None:
+@contextmanager
+def registry_lock():
     REGISTRY.parent.mkdir(parents=True, exist_ok=True)
-    tmp = REGISTRY.with_suffix(f".tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(registry, indent=2) + "\n")
-    tmp.replace(REGISTRY)
+    lock_path = REGISTRY.with_name("registry.lock")
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def save_registry(registry: dict, require_absent: bool = False) -> None:
+    """Merge entries while holding the registry lock.
+
+    A read/modify/write race here can silently lose a project created by a
+    concurrent `continuum new`, so the merge happens under the lock rather
+    than trusting the caller's earlier snapshot.
+    """
+    with registry_lock():
+        current = load_registry()
+        if require_absent:
+            duplicates = sorted(set(registry) & set(current))
+            if duplicates:
+                raise SystemExit(
+                    f"project already exists: {', '.join(duplicates)} "
+                    "(created by a concurrent command)"
+                )
+        current.update(registry)
+        tmp = REGISTRY.with_suffix(f".tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(current, indent=2) + "\n")
+        tmp.replace(REGISTRY)
 
 
 def project_dir(name: str) -> Path:
@@ -95,18 +152,69 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+class JsonlIntegrityError(ValueError):
+    """A JSONL file is corrupt before its final line."""
+
+
 def read_complete_jsonl(path: Path) -> str:
-    raw = path.read_text(errors="replace")
+    """Return complete records, rejecting corruption before the tail.
+
+    A partial final line is a normal crash artifact and is dropped. A bad line
+    with valid-looking data after it is corruption; silently truncating there
+    would lose history while still producing a "valid" archive.
+    """
+    try:
+        raw = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise JsonlIntegrityError(
+            f"invalid UTF-8 at byte {exc.start}: {exc.reason}"
+        ) from exc
+    # Split only on LF. str.splitlines() also splits on U+2028/U+2029 and
+    # other Unicode separators that can legally appear inside JSON strings.
+    lines = raw.split("\n")
     kept: list[str] = []
-    for line in raw.splitlines():
-        if not line.strip():
+    for index, line in enumerate(lines):
+        candidate = line[:-1] if line.endswith("\r") else line
+        if not candidate.strip():
             continue
         try:
-            json.loads(line)
-        except json.JSONDecodeError:
+            json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            later = "\n".join(lines[index + 1 :]).strip()
+            if later:
+                raise JsonlIntegrityError(
+                    f"malformed JSONL at line {index + 1}: {exc.msg}"
+                ) from exc
             break
-        kept.append(line)
+        kept.append(candidate)
     return "\n".join(kept) + "\n"
+
+
+def jsonl_stats(text: str) -> tuple[int, str | None]:
+    rows = [line for line in text.split("\n") if line.strip()]
+    last_id: str | None = None
+    for line in reversed(rows):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("id"), str):
+            last_id = row["id"]
+            break
+    return len(rows), last_id
+
+
+def archive_inventory(day_dir: Path) -> dict[str, dict]:
+    files: dict[str, dict] = {}
+    for path in sorted(day_dir.rglob("*")):
+        if not path.is_file() or path.name in {"manifest.json", "seal.json"}:
+            continue
+        relative = path.relative_to(day_dir).as_posix()
+        files[relative] = {
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+    return files
 
 
 def append_ledger(root: Path, event: str, **fields) -> None:
@@ -117,16 +225,26 @@ def append_ledger(root: Path, event: str, **fields) -> None:
         handle.write(json.dumps(row) + "\n")
 
 
+def backup_path(root: Path, relative: Path, stamp: str | None = None) -> Path:
+    stamp = stamp or utc_now().replace(":", "").replace(".", "").replace("+", "-")
+    return root / ".agent" / "backups" / f"new-{stamp}" / relative
+
+
 def copy_template(root: Path, force: bool = False) -> None:
     if not TEMPLATE.exists():
         raise SystemExit(f"template not found: {TEMPLATE}")
+    stamp = utc_now().replace(":", "").replace(".", "").replace("+", "-")
     for source in TEMPLATE.rglob("*"):
         if not source.is_file():
             continue
         relative = source.relative_to(TEMPLATE)
         destination = root / relative
-        if destination.exists() and not force:
+        if destination.exists() and (not force or relative in MERGE_TEMPLATE_FILES):
             continue
+        if destination.exists() and force:
+            backup = backup_path(root, relative, stamp)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(destination, backup)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
     sample = root / ".agent" / "project.example.json"
@@ -168,13 +286,34 @@ def copy_subagent_state(root: Path, session_file: Path, session_id: str, day_dir
         shutil.copytree(interactive_dir, day_dir / "artifacts", dirs_exist_ok=True)
 
 
+def pi_package_listing(cwd: Path | None = None) -> str | None:
+    if shutil.which(pi_binary()) is None:
+        return None
+    try:
+        result = subprocess.run(
+            [pi_binary(), "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=cwd,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
 def continuum_package_installed() -> bool:
     agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", HOME / ".pi" / "agent"))
     candidates = [
         agent_dir / "npm" / "node_modules" / "pi-continuum",
         HOME / ".pi" / "agent" / "npm" / "node_modules" / "pi-continuum",
     ]
-    return any(path.exists() for path in candidates)
+    if any(path.exists() for path in candidates):
+        return True
+    # Git-installed Pi packages do not necessarily live under npm/node_modules.
+    # `pi list` is the authoritative installed-package view when Pi is present.
+    listing = pi_package_listing()
+    return bool(listing and "pi-continuum" in listing)
 
 
 def copy_runtime_extension(root: Path, force: bool = False) -> None:
@@ -200,11 +339,160 @@ def wrapper_dir() -> Path:
     return candidates[0]
 
 
+def package_identity(spec: str) -> str:
+    value = spec.strip()
+    if value.startswith("npm:"):
+        value = value[4:]
+    slash = value.find("/")
+    at = value.find("@", slash + 1 if slash >= 0 else 1)
+    return value[:at] if at > 0 else value
+
+
+def merge_settings(path: Path, verifier_model: str, override_verifier: bool = False) -> None:
+    """Add Continuum requirements without discarding existing Pi settings."""
+    settings = read_json(path, {}) or {}
+    if not isinstance(settings, dict):
+        raise SystemExit(f"invalid settings (expected object): {path}")
+
+    settings.setdefault("sessionDir", ".agent/sessions")
+    packages = settings.setdefault("packages", [])
+    if not isinstance(packages, list):
+        raise SystemExit(f"invalid packages list in {path}")
+    identities = {package_identity(str(item)) for item in packages}
+    for required in REQUIRED_PACKAGES:
+        identity = package_identity(required)
+        if identity not in identities:
+            packages.append(required)
+            identities.add(identity)
+
+    subagents = settings.setdefault("subagents", {})
+    if not isinstance(subagents, dict):
+        raise SystemExit(f"invalid subagents object in {path}")
+    subagents.setdefault("defaultModel", DEFAULT_MODEL)
+    subagents.setdefault("defaultThinking", "high")
+    # Core agents also declare this explicitly. Keeping the project default
+    # prevents a future agent from silently loading pi-clm/continuum again.
+    subagents.setdefault("defaultExtensions", [])
+    overrides = subagents.setdefault("agentOverrides", {})
+    if not isinstance(overrides, dict):
+        raise SystemExit(f"invalid subagents.agentOverrides object in {path}")
+    verifier = overrides.setdefault("verifier", {})
+    if not isinstance(verifier, dict):
+        raise SystemExit(f"invalid verifier override in {path}")
+    # Preserve an existing explicit override when re-running `new` on an
+    # existing repository. A fresh project has no override and gets the CLI
+    # value (or the default).
+    if override_verifier:
+        verifier["model"] = verifier_model
+    else:
+        verifier.setdefault("model", verifier_model)
+
+    write_atomic(path, json.dumps(settings, indent=2) + "\n")
+
+
+def merge_gitignore(root: Path) -> None:
+    path = root / ".gitignore"
+    existing = path.read_text() if path.exists() else ""
+    required = [".agent/*", "!.agent/.gitignore", "*.jsonl", "auth.json", ".env", ".env.*"]
+    if all(item in existing.splitlines() for item in required):
+        return
+    block = (
+        "# BEGIN continuum runtime\n"
+        + "\n".join(required)
+        + "\n# END continuum runtime\n"
+    )
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix:
+        prefix += "\n"
+    write_atomic(path, prefix + block)
+
+
+def ensure_agent_gitignore(root: Path) -> None:
+    path = root / ".agent" / ".gitignore"
+    if not path.exists():
+        write_atomic(path, "*\n!.gitignore\n")
+
+
+def acquire_writer_lock(root: Path) -> int:
+    """Hold an exclusive project writer lock for the lifetime of the process."""
+    path = root / ".agent" / "locks" / "open.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise SystemExit(
+            f"project is already open: {root} (open.lock is held by another writer)"
+        ) from exc
+    os.set_inheritable(fd, True)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+@contextmanager
+def exclusive_project_lock(root: Path):
+    path = root / ".agent" / "locks" / "open.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit(
+                f"project is open: {root} (close the writer before this operation)"
+            ) from exc
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def shared_project_lock(root: Path):
+    path = root / ".agent" / "locks" / "open.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit(
+                f"project is open: {root} (close the writer before this operation)"
+            ) from exc
+        yield
+    finally:
+        os.close(fd)
+
+
+def cmd_internal_run(args: argparse.Namespace) -> int:
+    """Acquire the writer lock, then exec a command inside a tmux pane."""
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise SystemExit("_run requires a command")
+    root = Path(args.root).expanduser().resolve()
+    acquire_writer_lock(root)
+    os.chdir(root)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(command[0], command, os.environ.copy())
+    return 0
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     name = safe_name(args.name)
     registry = load_registry()
     if name in registry and not args.force:
         raise SystemExit(f"project already exists: {name} (use --force to overwrite metadata)")
+    if not args.no_link and name in RESERVED_WRAPPER_NAMES:
+        raise SystemExit(
+            f"project name '{name}' is reserved; it would shadow a command on PATH. "
+            "Use --no-link or choose another name."
+        )
 
     repo = Path(args.repo).expanduser().resolve()
     if not repo.exists():
@@ -212,10 +500,42 @@ def cmd_new(args: argparse.Namespace) -> int:
     if not repo.is_dir():
         raise SystemExit(f"not a directory: {repo}")
 
+    for other_name, entry in registry.items():
+        if other_name == name:
+            continue
+        other_repo = Path(entry.get("repo", "")).expanduser()
+        try:
+            same_repo = other_repo.resolve() == repo
+        except OSError:
+            same_repo = False
+        if same_repo and not args.force:
+            raise SystemExit(
+                f"repository is already registered as '{other_name}': {repo} "
+                "(use --force to register a second name)"
+            )
+
+    if not args.no_link:
+        existing_cmd = shutil.which(name)
+        target = Path(__file__).resolve()
+        if existing_cmd and Path(existing_cmd).resolve() != target:
+            raise SystemExit(
+                f"'{name}' already resolves to {existing_cmd}; refusing to shadow it. "
+                "Use --no-link or choose another name."
+            )
+
+    settings_path = repo / ".pi" / "settings.json"
+    settings_existed = settings_path.exists()
     (repo / ".agent" / "sessions" / "days").mkdir(parents=True, exist_ok=True)
     (repo / ".agent" / "artifacts").mkdir(parents=True, exist_ok=True)
     (repo / ".agent" / "locks").mkdir(parents=True, exist_ok=True)
     copy_template(repo, force=args.force)
+    merge_gitignore(repo)
+    ensure_agent_gitignore(repo)
+    merge_settings(
+        settings_path,
+        args.verifier_model,
+        override_verifier=not settings_existed,
+    )
     if args.local_extension or (not args.no_local_extension and not continuum_package_installed()):
         copy_runtime_extension(repo, force=args.force)
 
@@ -244,8 +564,10 @@ def cmd_new(args: argparse.Namespace) -> int:
     }
     write_atomic(repo / ".agent" / "project.json", json.dumps(project, indent=2) + "\n")
 
-    registry[name] = {"repo": str(repo), "created_at": project["created_at"]}
-    save_registry(registry)
+    save_registry(
+        {name: {"repo": str(repo), "created_at": project["created_at"]}},
+        require_absent=name not in registry,
+    )
 
     linked = False
     link: Path | None = None
@@ -258,11 +580,18 @@ def cmd_new(args: argparse.Namespace) -> int:
             if link.is_symlink() and link.resolve() == target:
                 linked = True
             elif args.force:
+                if link.is_symlink() or link.is_file():
+                    backup = backup_path(repo, Path("wrapper") / name)
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(link, backup)
                 link.unlink()
                 link.symlink_to(target)
                 linked = True
             else:
-                print(f"warning: {link} exists; not replacing it", file=sys.stderr)
+                raise SystemExit(
+                    f"wrapper already exists and is not Continuum: {link} "
+                    "(use --force to replace it or --no-link)"
+                )
         else:
             link.symlink_to(target)
             linked = True
@@ -309,6 +638,21 @@ def active_session(root: Path) -> dict | None:
     return read_json(root / ".agent" / "active.json", None)
 
 
+def active_session_file(root: Path, active: dict) -> Path:
+    """Resolve Pi's session path against the project root.
+
+    Pi may report a project-relative path (for example
+    `.agent/sessions/<file>.jsonl`) while the launcher is invoked from any
+    directory. Treating that path as relative to the caller's cwd makes
+    resume, seal, and fork fail even though the session exists.
+    """
+    raw = active.get("session_file")
+    if not isinstance(raw, str) or not raw:
+        return root / ".agent" / "sessions" / "__missing__"
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else root / path
+
+
 def session_dir(root: Path) -> Path:
     return root / ".agent" / "sessions"
 
@@ -331,6 +675,18 @@ def clm_env(root: Path, project: dict) -> dict:
     env["PI_PROJECT_NAME"] = project["name"]
     env["PI_PROJECT_ROOT"] = str(root)
     return env
+
+
+def effective_verifier_model(root: Path, project: dict) -> str:
+    settings = read_json(root / ".pi" / "settings.json", {}) or {}
+    subagents = settings.get("subagents") if isinstance(settings, dict) else None
+    overrides = subagents.get("agentOverrides") if isinstance(subagents, dict) else None
+    verifier = overrides.get("verifier") if isinstance(overrides, dict) else None
+    model = verifier.get("model") if isinstance(verifier, dict) else None
+    if isinstance(model, str) and model:
+        return model
+    configured = project.get("verifier_model", DEFAULT_VERIFIER)
+    return configured if isinstance(configured, str) and configured else DEFAULT_VERIFIER
 
 
 def launch_command(
@@ -360,7 +716,17 @@ def launch_command(
 def start_in_tmux(root: Path, project: dict, cmd: list[str]) -> None:
     session = project.get("tmux", {}).get("session", f"pi-{project['name']}")
     env = clm_env(root, project)
-    command = " ".join(shlex.quote(part) for part in cmd)
+    # The pane process, not the short-lived tmux client, must hold the writer
+    # lock. A tiny internal launcher acquires it and then execs Pi.
+    locked_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_run",
+        str(root),
+        "--",
+        *cmd,
+    ]
+    command = " ".join(shlex.quote(part) for part in locked_cmd)
 
     # Creating a session from inside tmux is rejected unless $TMUX is removed
     # from the child environment. Create it detached, then switch this client.
@@ -387,6 +753,8 @@ def start_in_tmux(root: Path, project: dict, cmd: list[str]) -> None:
         str(root),
         command,
     ]
+    sys.stdout.flush()
+    sys.stderr.flush()
     os.execvpe("tmux", tmux_cmd, env)
 
 def quick_preflight(root: Path, project: dict, require_tmux: bool = False) -> bool:
@@ -399,7 +767,7 @@ def quick_preflight(root: Path, project: dict, require_tmux: bool = False) -> bo
         problems.append("tmux is not installed; interactive subagents need tmux")
     active = active_session(root)
     if active:
-        session_file = Path(active.get("session_file", "")).expanduser()
+        session_file = active_session_file(root, active)
         if not session_file.exists():
             problems.append(f"active session file missing: {session_file}")
     if problems:
@@ -416,13 +784,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     project = read_json(root / ".agent" / "project.json", None) or {}
     active = active_session(root)
     failures = 0
+    warnings = 0
 
     def check(label: str, ok: bool, detail: str = "", required: bool = True) -> None:
-        nonlocal failures
+        nonlocal failures, warnings
         status = "PASS" if ok else ("FAIL" if required else "WARN")
         print(f"{status:4} {label}" + (f": {detail}" if detail else ""))
-        if not ok and required:
-            failures += 1
+        if not ok:
+            if required:
+                failures += 1
+            else:
+                warnings += 1
 
     check("repo exists", root.exists(), str(root))
     check("project config", (root / ".agent" / "project.json").exists(), str(root / ".agent" / "project.json"))
@@ -439,29 +811,96 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("tmux", tmux_available(), "required for interactive subagents", required=False)
 
     if active:
-        session_file = Path(active.get("session_file", "")).expanduser()
+        session_file = active_session_file(root, active)
         check("active session file", session_file.exists(), str(session_file))
 
     # Package declarations are a stronger signal than guessing install paths.
     settings = read_json(root / ".pi" / "settings.json", {}) or {}
+    if not isinstance(settings, dict):
+        settings = {}
     packages = settings.get("packages", [])
     declared = "\n".join(str(item) for item in packages)
     check("pi-clm declared", "pi-clm" in declared, "npm:@lolipopshock/pi-clm")
     check("pi-subagents declared", "pi-subagents" in declared, "npm:pi-subagents")
+
+    listing = pi_package_listing(root)
+    if listing is not None:
+        check("pi-clm installed", "pi-clm" in listing, "pi list", required=False)
+        check("pi-subagents installed", "pi-subagents" in listing, "pi list", required=False)
+    check(
+        "no second compaction manager",
+        "pi-observational-memory" not in declared,
+        "pi-clm and pi-observational-memory must not run together",
+        required=False,
+    )
 
     # Model auth: do not print secrets; just check common sources.
     auth = read_json(HOME / ".pi" / "agent" / "auth.json", {}) or {}
     has_key = bool(os.environ.get("DEEPSEEK_API_KEY")) or "deepseek" in auth
     check("DeepSeek auth", has_key, "set DEEPSEEK_API_KEY or use /login deepseek", required=False)
 
+    configured_verifier = project.get("verifier_model", DEFAULT_VERIFIER)
+    effective_verifier = effective_verifier_model(root, project)
+    check(
+        "effective verifier model",
+        effective_verifier == configured_verifier,
+        f"{effective_verifier} (configured {configured_verifier})",
+    )
+
     check("rollover mode", project.get("rollover", {}).get("mode") in {"snapshot", "fork"}, project.get("rollover", {}).get("mode", "missing"))
     print()
     if failures:
         print(f"{failures} required check(s) failed")
         return 1
+    if warnings:
+        print(f"ready with {warnings} warning(s)")
+        return 0
     print("ready")
     return 0
 
+
+
+def used_session_ids(root: Path) -> set[str]:
+    """Collect session IDs from live files, active state, and archived days.
+
+    Pi names live files with a timestamp prefix, so checking only
+    ``<session-id>.jsonl`` misses collisions. Header IDs and archive directory
+    names are the authoritative identifiers.
+    """
+    ids: set[str] = set()
+    active = active_session(root)
+    if active and isinstance(active.get("session_id"), str):
+        ids.add(active["session_id"])
+
+    sessions = session_dir(root)
+    if sessions.is_dir():
+        for path in sessions.glob("*.jsonl"):
+            try:
+                with path.open() as handle:
+                    header = json.loads(handle.readline())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(header, dict) and isinstance(header.get("id"), str):
+                ids.add(header["id"])
+
+        days = sessions / "days"
+        if days.is_dir():
+            for day_dir in days.iterdir():
+                if day_dir.is_dir():
+                    ids.update(item.name for item in day_dir.iterdir() if item.is_dir())
+    return ids
+
+
+def fresh_session_id(root: Path, name: str, day: str | None = None) -> str:
+    base = f"{name}-{(day or utc_day()).replace('-', '')}"
+    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+    used = used_session_ids(root)
+    candidate = f"{base}-{stamp}"
+    counter = 1
+    while candidate in used:
+        candidate = f"{base}-{stamp}-{counter}"
+        counter += 1
+    return candidate
 
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -475,31 +914,53 @@ def cmd_open(args: argparse.Namespace) -> int:
         return 2
 
     session = project.get("tmux", {}).get("session", f"pi-{name}")
-    if tmux_has(session):
+    use_tmux = tmux_available() and not args.no_tmux
+
+    # Attach is an interactive action, not a dry-run action. Check it only
+    # after dry-run has been ruled out, and only when tmux is actually wanted.
+    if not args.dry_run and use_tmux and tmux_has(session):
         attach_tmux(session)
         return 0
 
-    use_tmux = tmux_available() and not args.no_tmux
     if not tmux_available():
         print("warning: tmux not found; running directly without attach/resume support", file=sys.stderr)
     elif args.no_tmux:
         print("warning: --no-tmux; running directly without attach/resume support", file=sys.stderr)
 
+    # Hold the project writer lock for the life of a direct Pi process. The fd
+    # is inheritable, so execve keeps the flock held without a supervisor.
+    if not args.dry_run and not use_tmux:
+        acquire_writer_lock(root)
+
     active = active_session(root)
     today = utc_day()
     fork_from: Path | None = None
     session_id = f"{name}-{today.replace('-', '')}"
+    mode = project.get("rollover", {}).get("mode", "snapshot")
 
     if active:
-        session_file = Path(active.get("session_file", "")).expanduser()
+        session_file = active_session_file(root, active)
         active_day = active.get("utc_day")
         session_id = active.get("session_id") or session_id
         if active_day and active_day != today:
-            print(f"UTC day changed: {active_day} -> {today}; sealing {active_day}")
-            seal_project(name, quiet=True)
-            if project.get("rollover", {}).get("mode", "snapshot") == "fork" and session_file.exists():
+            action = "would seal" if args.dry_run else "sealing"
+            target = (
+                root
+                / ".agent"
+                / "sessions"
+                / "days"
+                / active_day
+                / session_id
+            )
+            print(
+                f"UTC day changed: {active_day} -> {today}; "
+                f"{action} {active_day} -> {target} (reason: open-rollover)"
+            )
+            if not args.dry_run:
+                seal_project(name, quiet=True, reason="open-rollover", writer_locked=not use_tmux)
+            if mode == "fork" and session_file.exists():
                 fork_from = session_file
-                session_id = f"{name}-{today.replace('-', '')}"
+                session_id = fresh_session_id(root, name, today)
         elif session_file.exists():
             session_id = active.get("session_id") or session_id
 
@@ -527,6 +988,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     if not use_tmux:
         env = clm_env(root, project)
         os.chdir(root)
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.execvpe(cmd[0], cmd, env)
         return 0
 
@@ -534,8 +997,16 @@ def cmd_open(args: argparse.Namespace) -> int:
     return 0
 
 
-def seal_project(name: str, quiet: bool = False) -> int:
+def seal_project(
+    name: str,
+    quiet: bool = False,
+    reason: str = "manual-seal",
+    writer_locked: bool = False,
+) -> int:
     root = project_dir(name)
+    if not writer_locked:
+        with exclusive_project_lock(root):
+            return seal_project(name, quiet=quiet, reason=reason, writer_locked=True)
     project = read_json(root / ".agent" / "project.json", None)
     if not project:
         raise SystemExit(f"missing project config for {name}")
@@ -554,35 +1025,54 @@ def seal_project(name: str, quiet: bool = False) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        session_file = Path(active["session_file"]).expanduser()
+        session_file = active_session_file(root, active)
         if not session_file.exists():
             raise SystemExit(f"session file missing: {session_file}")
 
-        complete = read_complete_jsonl(session_file)
+        try:
+            complete = read_complete_jsonl(session_file)
+        except JsonlIntegrityError as exc:
+            raise SystemExit(f"cannot seal {name}: {exc}") from exc
+        rows = [line for line in complete.split("\n") if line.strip()]
+        if not rows:
+            raise SystemExit(f"cannot seal {name}: session has no complete JSONL records")
+        try:
+            header = json.loads(rows[0])
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"cannot seal {name}: invalid session header: {exc.msg}") from exc
+        if (
+            not isinstance(header, dict)
+            or header.get("type") != "session"
+            or not isinstance(header.get("id"), str)
+        ):
+            raise SystemExit(f"cannot seal {name}: first JSONL record is not a session header")
+        if header["id"] != session_id:
+            raise SystemExit(
+                f"cannot seal {name}: active session id {session_id!r} "
+                f"does not match header id {header['id']!r}"
+            )
         snapshot_file = day_dir / "session.jsonl"
-        snapshot_file.write_text(complete)
+        write_atomic(snapshot_file, complete)
         digest = hashlib.sha256(complete.encode()).hexdigest()
+        entry_count, last_entry_id = jsonl_stats(complete)
 
         copy_subagent_state(root, session_file, session_id, day_dir)
 
-        for name_file in (
-            "TASK.md",
-            "PLAN.md",
-            "VERDICT.json",
-            "HANDOFF.md",
-            "diff.patch",
-            "tests.log",
-        ):
+        for name_file in EVIDENCE_FILES:
             source = root / name_file
+            destination = day_dir / name_file
             if source.exists():
-                shutil.copy2(source, day_dir / name_file)
+                shutil.copy2(source, destination)
+            elif destination.exists():
+                destination.unlink()
+        missing_evidence = [name_file for name_file in REQUIRED_EVIDENCE if not (root / name_file).exists()]
 
         previous_seal = None
         seal_path = day_dir / "seal.json"
         if seal_path.exists():
             try:
                 previous_seal = json.loads(seal_path.read_text()).get("seal")
-            except json.JSONDecodeError:
+            except (OSError, json.JSONDecodeError):
                 previous_seal = None
 
         manifest = {
@@ -592,10 +1082,15 @@ def seal_project(name: str, quiet: bool = False) -> int:
             "session_file": str(session_file),
             "leaf_id": active.get("leaf_id"),
             "snapshot_at": utc_now(),
-            "reason": "manual-seal",
+            "reason": reason,
             "model": active.get("model"),
+            "source_bytes": session_file.stat().st_size,
             "bytes": snapshot_file.stat().st_size,
             "sha256": digest,
+            "entry_count": entry_count,
+            "last_entry_id": last_entry_id,
+            "missing_evidence": missing_evidence,
+            "files": archive_inventory(day_dir),
         }
         write_atomic(day_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
         seal = {
@@ -606,7 +1101,7 @@ def seal_project(name: str, quiet: bool = False) -> int:
             ).hexdigest(),
         }
         write_atomic(seal_path, json.dumps(seal, indent=2) + "\n")
-        append_ledger(root, "day_seal", day=day, session_id=session_id, reason="manual-seal", sha256=digest)
+        append_ledger(root, "day_seal", day=day, session_id=session_id, reason=reason, sha256=digest)
 
     if not quiet:
         print(f"sealed {name} / {day}")
@@ -634,13 +1129,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"project:  {name}")
     print(f"repo:     {root}")
     print(f"model:    {project.get('model', DEFAULT_MODEL)}")
-    print(f"verifier: {project.get('verifier_model', DEFAULT_VERIFIER)}")
+    print(f"verifier: {effective_verifier_model(root, project)} (effective)")
     print(f"rollover: {project.get('rollover', {}).get('mode', 'snapshot')}")
     print(f"tmux:     {'running' if tmux_has(session) else 'stopped'} ({session})")
     print(f"utc day:  {utc_day()}")
     if active:
         print(f"active:   {active.get('utc_day')} / {active.get('session_id')}")
-        print(f"session:  {active.get('session_file')}")
+        print(f"session:  {active_session_file(root, active)}")
     else:
         print("active:   (none)")
     if last_event:
@@ -680,47 +1175,299 @@ def cmd_backup(args: argparse.Namespace) -> int:
     env["CONTINUUM_REPO"] = str(root)
     env["CONTINUUM_STATE"] = str(root / ".agent")
     print(f"backing up {name}")
-    result = subprocess.run(command, shell=True, cwd=root, env=env)
-    append_ledger(root, "backup", command=command, exit_code=result.returncode)
+    with shared_project_lock(root):
+        result = subprocess.run(command, shell=True, cwd=root, env=env)
+        append_ledger(root, "backup", command=command, exit_code=result.returncode)
     if result.returncode != 0:
         print(f"backup failed with exit code {result.returncode}", file=sys.stderr)
     return result.returncode
 
 
-def cmd_verify(args: argparse.Namespace) -> int:
+def _cmd_verify(args: argparse.Namespace) -> int:
     name = safe_name(args.name)
     root = Path(args.root).expanduser().resolve() if getattr(args, "root", None) else project_dir(name)
+    if not root.exists():
+        print(f"FAIL: project root does not exist: {root}")
+        return 1
     days = root / ".agent" / "sessions" / "days"
-    if not days.exists():
-        print("no day archives")
-        return 0
+    allow_empty = bool(getattr(args, "allow_empty", False))
+
+    archive_dirs: list[Path] = []
+    if days.exists():
+        for day_dir in sorted(days.iterdir()):
+            if not day_dir.is_dir():
+                continue
+            for archive in sorted(day_dir.iterdir()):
+                if archive.is_dir():
+                    archive_dirs.append(archive)
+
+    ledger_path = root / ".agent" / "ledger.ndjson"
+    expected: set[tuple[str, str]] = set()
     failures = 0
-    manifests = sorted(days.glob("*/manifest.json")) + sorted(days.glob("*/*/manifest.json"))
-    for manifest_path in manifests:
-        manifest = read_json(manifest_path, {})
-        session_file = manifest_path.parent / "session.jsonl"
-        if not session_file.exists():
-            print(f"FAIL {manifest_path.parent.name}: missing session.jsonl")
-            failures += 1
-            continue
-        digest = sha256_file(session_file)
-        expected = manifest.get("sha256")
-        if digest != expected:
-            print(f"FAIL {manifest_path.parent.name}: hash mismatch")
-            failures += 1
-            continue
-        seal_path = manifest_path.parent / "seal.json"
-        if seal_path.exists():
-            seal = read_json(seal_path, {})
-            expected_seal = hashlib.sha256(
-                f"{seal.get('previous_seal') or ''}\n{manifest.get('sha256')}\n{manifest.get('snapshot_at')}".encode()
-            ).hexdigest()
-            if seal.get("seal") != expected_seal:
-                print(f"FAIL {manifest_path.parent.name}: seal chain mismatch")
+    if ledger_path.exists():
+        for lineno, line in enumerate(ledger_path.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"FAIL ledger.ndjson:{lineno}: malformed JSON")
                 failures += 1
                 continue
-        print(f"PASS {manifest_path.parent.name}: {digest[:12]}…")
-    return 1 if failures else 0
+            if not isinstance(event, dict):
+                print(f"FAIL ledger.ndjson:{lineno}: expected object")
+                failures += 1
+                continue
+            if event.get("event") == "day_seal":
+                day = event.get("day")
+                session_id = event.get("session_id")
+                if isinstance(day, str) and isinstance(session_id, str):
+                    expected.add((day, session_id))
+    elif archive_dirs:
+        print("FAIL: ledger.ndjson is missing; cannot verify archive provenance")
+        failures += 1
+
+    if not days.exists() or not archive_dirs:
+        if allow_empty and not expected and failures == 0:
+            print("PASS: no day archives (allowed empty)")
+            return 0
+        print("FAIL: no day archives found")
+        return 1
+
+    verified = 0
+    for archive in archive_dirs:
+        day = archive.parent.name
+        session_id = archive.name
+        errors: list[str] = []
+        manifest_path = archive / "manifest.json"
+        seal_path = archive / "seal.json"
+        session_path = archive / "session.jsonl"
+
+        if not manifest_path.exists():
+            errors.append("missing manifest.json")
+        if not seal_path.exists():
+            errors.append("missing seal.json")
+        if not session_path.exists():
+            errors.append("missing session.jsonl")
+        if errors:
+            for error in errors:
+                print(f"FAIL {day}/{session_id}: {error}")
+            failures += 1
+            continue
+
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            seal = json.loads(seal_path.read_text())
+        except json.JSONDecodeError as exc:
+            print(f"FAIL {day}/{session_id}: invalid JSON: {exc}")
+            failures += 1
+            continue
+        if not isinstance(manifest, dict) or not isinstance(seal, dict):
+            print(f"FAIL {day}/{session_id}: manifest and seal must be objects")
+            failures += 1
+            continue
+
+        if manifest.get("project") != name:
+            errors.append(f"project {manifest.get('project')!r} != {name!r}")
+        if manifest.get("day") != day:
+            errors.append(f"day {manifest.get('day')!r} != {day!r}")
+        if manifest.get("session_id") != session_id:
+            errors.append(f"session_id {manifest.get('session_id')!r} != {session_id!r}")
+        if manifest.get("bytes") != session_path.stat().st_size:
+            errors.append("manifest bytes do not match session.jsonl")
+        digest = sha256_file(session_path)
+        if manifest.get("sha256") != digest:
+            errors.append("session hash mismatch")
+        if seal.get("sha256") != digest or seal.get("snapshot_at") != manifest.get("snapshot_at"):
+            errors.append("seal does not match manifest")
+        expected_seal = hashlib.sha256(
+            f"{seal.get('previous_seal') or ''}\n{digest}\n{manifest.get('snapshot_at')}".encode()
+        ).hexdigest()
+        if seal.get("seal") != expected_seal:
+            errors.append("seal hash mismatch")
+
+        missing = manifest.get("missing_evidence")
+        if not isinstance(missing, list):
+            errors.append("manifest missing_evidence list")
+        elif missing:
+            errors.append(f"missing required evidence: {', '.join(str(item) for item in missing)}")
+
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            errors.append("manifest file inventory is missing")
+        else:
+            if "session.jsonl" not in files:
+                errors.append("manifest inventory does not include session.jsonl")
+            archive_root = archive.resolve()
+            for relative, expected_file in files.items():
+                if not isinstance(relative, str) or not isinstance(expected_file, dict):
+                    errors.append("invalid file inventory entry")
+                    continue
+                target = (archive / relative).resolve()
+                try:
+                    target.relative_to(archive_root)
+                except ValueError:
+                    errors.append(f"inventory path escapes archive: {relative}")
+                    continue
+                if not target.is_file():
+                    errors.append(f"missing archived file: {relative}")
+                    continue
+                if target.stat().st_size != expected_file.get("bytes"):
+                    errors.append(f"size mismatch: {relative}")
+                if sha256_file(target) != expected_file.get("sha256"):
+                    errors.append(f"hash mismatch: {relative}")
+            actual_files = {
+                path.relative_to(archive).as_posix()
+                for path in archive.rglob("*")
+                if path.is_file() and path.name not in {"manifest.json", "seal.json"}
+            }
+            unlisted = sorted(actual_files - set(files))
+            if unlisted:
+                errors.append(f"unlisted archived file(s): {', '.join(unlisted)}")
+
+        try:
+            header = json.loads(session_path.read_text().splitlines()[0])
+        except (IndexError, json.JSONDecodeError):
+            header = {}
+        if header.get("id") != session_id:
+            errors.append("session header id does not match archive path")
+
+        lines = [line for line in session_path.read_text().splitlines() if line.strip()]
+        if manifest.get("entry_count") != len(lines):
+            errors.append("entry_count mismatch")
+        last_id = None
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                last_id = row["id"]
+                break
+        if last_id != manifest.get("last_entry_id"):
+            errors.append("last_entry_id mismatch")
+        leaf_id = manifest.get("leaf_id")
+        if leaf_id:
+            ids = set()
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("id"), str):
+                    ids.add(row["id"])
+            if leaf_id not in ids:
+                errors.append("leaf_id not present in snapshot")
+
+        if (day, session_id) not in expected:
+            errors.append("no day_seal event in ledger.ndjson")
+
+        if errors:
+            for error in errors:
+                print(f"FAIL {day}/{session_id}: {error}")
+            failures += 1
+            continue
+
+        verified += 1
+        print(f"PASS {day}/{session_id}: {digest[:12]}…")
+
+    for day, session_id in sorted(expected):
+        if not (days / day / session_id).is_dir():
+            print(f"FAIL {day}/{session_id}: archive recorded in ledger is missing")
+            failures += 1
+
+    if failures:
+        print(f"{failures} verification failure(s)")
+        return 1
+    print(f"PASS: {verified} archive(s) verified")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Verify a project while preventing a direct writer from changing state."""
+    if getattr(args, "root", None):
+        return _cmd_verify(args)
+    name = safe_name(args.name)
+    root = project_dir(name)
+    with shared_project_lock(root):
+        return _cmd_verify(
+            argparse.Namespace(
+                name=name,
+                root=str(root),
+                allow_empty=getattr(args, "allow_empty", False),
+            )
+        )
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Deterministic completion gate for TASK.md + VERDICT.json."""
+    name = safe_name(args.name)
+    root = project_dir(name)
+    task_path = root / "TASK.md"
+    verdict_path = root / "VERDICT.json"
+    problems: list[str] = []
+
+    if not task_path.exists():
+        problems.append("TASK.md is missing")
+    if not verdict_path.exists():
+        problems.append("VERDICT.json is missing")
+    if problems:
+        for problem in problems:
+            print(f"FAIL: {problem}")
+        return 1
+
+    try:
+        verdict = json.loads(verdict_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"FAIL: invalid VERDICT.json: {exc}")
+        return 1
+    if not isinstance(verdict, dict):
+        print("FAIL: VERDICT.json must be an object")
+        return 1
+    if verdict.get("status") != "PASS":
+        print(f"FAIL: overall verdict is {verdict.get('status')!r}, not 'PASS'")
+        return 1
+
+    checks = verdict.get("checks")
+    if not isinstance(checks, list) or not checks:
+        print("FAIL: VERDICT.json must contain a non-empty 'checks' list")
+        return 1
+
+    task_ids = set(
+        re.findall(r"^- \[[ xX]\]\s*(AC-[A-Za-z0-9_.-]+)", task_path.read_text(), re.MULTILINE)
+    )
+    if not task_ids:
+        print("FAIL: TASK.md has no AC-* acceptance checks")
+        return 1
+    seen_ids: set[str] = set()
+    for index, item in enumerate(checks, 1):
+        if not isinstance(item, dict):
+            print(f"FAIL: checks[{index}] must be an object")
+            return 1
+        check_id = item.get("id")
+        if not isinstance(check_id, str) or not check_id:
+            print(f"FAIL: checks[{index}] is missing a string 'id'")
+            return 1
+        seen_ids.add(check_id)
+        if item.get("status") != "PASS":
+            print(f"FAIL: {check_id} is {item.get('status')!r}, not 'PASS'")
+            return 1
+        evidence = item.get("evidence")
+        if not evidence:
+            print(f"FAIL: {check_id} has no evidence")
+            return 1
+        if not isinstance(evidence, (str, list, dict)):
+            print(f"FAIL: {check_id} evidence must be text or structured evidence")
+            return 1
+
+    missing_ids = sorted(task_ids - seen_ids)
+    if missing_ids:
+        print(f"FAIL: TASK.md acceptance checks lack verdict evidence: {', '.join(missing_ids)}")
+        return 1
+
+    append_ledger(root, "done_gate", verdict=str(verdict_path), checks=sorted(seen_ids))
+    print(f"PASS: {len(seen_ids)} acceptance check(s) have evidence and PASS verdict")
+    return 0
 
 
 def cmd_fork_day(args: argparse.Namespace) -> int:
@@ -734,22 +1481,30 @@ def cmd_fork_day(args: argparse.Namespace) -> int:
     session = project.get("tmux", {}).get("session", f"pi-{name}")
     if tmux_has(session):
         raise SystemExit(f"{session} is running; exit it before forking the day")
-    seal_project(name, quiet=True)
+
+    use_tmux = tmux_available() and not args.no_tmux
+    if not args.dry_run and not use_tmux:
+        acquire_writer_lock(root)
+    if not args.dry_run:
+        seal_project(name, quiet=True, reason="fork-day", writer_locked=not use_tmux)
     active = active_session(root)
     if not active:
         print("no active session; nothing to fork")
         return 0
-    old = Path(active["session_file"]).expanduser()
-    new_id = f"{name}-{utc_day().replace('-', '')}"
+    old = active_session_file(root, active)
+    new_id = fresh_session_id(root, name)
     cmd = launch_command(root, project, new_id, fork_from=old if old.exists() else None)
     print(f"forking {name} -> {new_id}")
     if args.dry_run:
+        print("dry-run: no seal, no session created")
         print("dry-run command:")
         print("  " + " ".join(shlex.quote(part) for part in cmd))
         return 0
-    if not tmux_available() or args.no_tmux:
+    if not use_tmux:
         env = clm_env(root, project)
         os.chdir(root)
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.execvpe(cmd[0], cmd, env)
         return 0
     start_in_tmux(root, project, cmd)
@@ -801,7 +1556,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify")
     verify.add_argument("name")
     verify.add_argument("--root", help="verify a restored project root instead of the registered repo")
+    verify.add_argument("--allow-empty", action="store_true", help="pass when a project has no archives yet")
     verify.set_defaults(func=cmd_verify)
+
+    check_cmd = sub.add_parser("check", help="validate TASK.md acceptance checks against VERDICT.json")
+    check_cmd.add_argument("name")
+    check_cmd.set_defaults(func=cmd_check)
 
     backup = sub.add_parser("backup", help="run the project's configured backup command")
     backup.add_argument("name")
@@ -818,6 +1578,11 @@ def build_parser() -> argparse.ArgumentParser:
     fork.add_argument("--dry-run", action="store_true")
     fork.add_argument("--no-preflight", action="store_true")
     fork.set_defaults(func=cmd_fork_day)
+
+    run = sub.add_parser("_run", help=argparse.SUPPRESS)
+    run.add_argument("root")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    run.set_defaults(func=cmd_internal_run)
 
     return parser
 

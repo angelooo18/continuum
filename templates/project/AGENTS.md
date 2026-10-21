@@ -19,12 +19,13 @@ This repository uses the Pi Project Runtime.
    - If this adds a project skill or extension, run the capability acceptance check in `PROJECT_SKILLS.md`.
 5. Run deterministic checks.
 6. Run the verifier. It must write `VERDICT.json`.
-7. Work is **not done** until:
+7. Run `continuum check <project>` and require `PASS`.
+8. Work is **not done** until:
    - every acceptance check has evidence,
    - tests/lint/typecheck pass,
    - verifier returns `PASS`,
    - no unresolved high-risk item remains.
-8. If verifier returns `FAIL`, fix and re-verify. After 3 loops, stop and ask the human.
+9. If verifier returns `FAIL`, fix and re-verify. After 3 loops, stop and ask the human.
 
 ## Context rules
 

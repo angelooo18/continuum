@@ -2,10 +2,37 @@
 
 ## Unreleased
 
+- Resolve Pi extension session paths against the project root, so `open`,
+  `seal`, and `fork-day` work when the launcher runs outside the repository.
+- Make fork IDs collision-safe against Pi's timestamp-prefixed live session
+  files and archived session directories.
+- Reject unlisted files during archive verification and require at least one
+  `AC-*` check in `TASK.md` for the completion gate.
+- Archive an extension snapshot taken at the UTC day boundary under the day
+  that ended, so sessions left open across midnight keep both day archives.
+- Isolate core subagents from ambient extensions: `extensions:` empty in every
+  core agent, `subagents.defaultExtensions: []` in project settings, and a
+  `PI_SUBAGENT_CHILD=1` guard in the Continuum extension.
+- Run the verifier in the foreground and add `continuum check` as a
+  deterministic `TASK.md`/`VERDICT.json` gate.
+- Make `verify` fail closed on missing roots, ledgers, manifests, seals,
+  archived evidence, and inventory/hash mismatches.
+- Reject malformed middle JSONL lines during seal/snapshot; only a partial
+  trailing line is dropped.
+- Add a project writer lock, an exclusive seal lock, shared backup/verify
+  locks, a locked tmux pane wrapper, and direct-launch refusal while another
+  writer is active.
+- Make `--dry-run` side-effect free and let `--no-tmux` bypass tmux attach.
+- Merge ignore/settings into existing repositories, add `.agent/.gitignore`,
+  back up `--force` overwrites, and refuse reserved/shadowing wrapper names.
+- Wire `--verifier-model` through `subagents.agentOverrides.verifier.model`.
+- Generate unique same-day fork IDs and record accurate seal reasons.
 - Document the default delegation depth, no-auto-spawn rule, and worktree condition in the project template.
 - Add a capability-acceptance check for project skills/extensions.
 - Add research notes for Meta-Harness, PluginRSI, Inside the Scaffold, the missing knowledge layer, and Jev decision-controller counterevidence.
 - Document deliberate non-goals: no runtime topology router, no recursive spawning, no Jev controller, and no observational memory in the lead.
+- Add regression coverage for the fail-closed verifier, dry-run, subagent
+  isolation, existing-repository merge, writer locks, and wrapper names.
 
 ## 0.1.7 — 2026-10-20
 

@@ -17,6 +17,11 @@ description: Evidence-based verification procedure for checking a change against
 5. For each acceptance check, record:
    - `PASS`, `FAIL`, or `UNVERIFIED`,
    - the exact evidence (command, output, file:line).
-6. Write `VERDICT.json` with an overall verdict and residual risks.
-7. Never mark a check `PASS` without evidence.
-8. A green test suite is necessary but not sufficient; acceptance checks still need evidence.
+6. Write `VERDICT.json` with the bash tool; do not edit source files. Include:
+   - `status`: `PASS` or `FAIL`,
+   - `checks`: one object per `AC-*` item with `id`, `status`, and `evidence`,
+   - `residual_risks`.
+7. Run `continuum check <project>`; it fails if a `TASK.md` acceptance check
+   is missing, unevidenced, or not `PASS`.
+8. Never mark a check `PASS` without evidence.
+9. A green test suite is necessary but not sufficient; acceptance checks still need evidence.

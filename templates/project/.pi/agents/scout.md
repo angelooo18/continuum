@@ -5,6 +5,7 @@ model: deepseek/deepseek-flash
 thinking: medium
 tools: read, grep, find, ls
 systemPromptMode: append
+extensions:
 async: true
 acceptanceRole: read-only
 advertise: true

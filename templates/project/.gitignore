@@ -1,6 +1,7 @@
 # Runtime state and private data
 .agent/*
 !.agent/project.example.json
+!.agent/.gitignore
 *.jsonl
 auth.json
 .env

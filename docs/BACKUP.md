@@ -21,7 +21,9 @@ Edit `.agent/project.json`:
 - `CONTINUUM_REPO` — project repository root
 - `CONTINUUM_STATE` — `<repo>/.agent`
 
-The command runs from the repository root. Its exit code is recorded in `.agent/ledger.ndjson`.
+The command runs from the repository root. Its exit code is recorded in
+`.agent/ledger.ndjson`. Backup takes a shared project lock and refuses while a
+writer or seal holds the project lock.
 
 Examples:
 
@@ -58,6 +60,6 @@ cp -a /path/to/restored/.agent /tmp/continuum-restore/.agent
 continuum verify acme --root /tmp/continuum-restore
 ```
 
-`verify` recomputes each session hash and seal chain. A `PASS` means the restored archive is internally consistent; it does not prove the backup provider’s retention or encryption.
+`verify` recomputes each session hash, seal, manifest inventory, and ledger record. A `PASS` means the restored archive is complete and internally consistent; it does not prove the backup provider’s retention or encryption, and the seal is not a retained cryptographic chain.
 
 For a full restore drill, also open a copied day archive in a scratch Pi session and confirm the expected session content is present.

@@ -6,7 +6,7 @@
 - `pi-subagents` for scoped specialists,
 - UTC-traceable per-session day archives,
 - a project name that resumes or attaches to the live session,
-- a verifier gate before work is marked done.
+- a verifier workflow plus a deterministic `continuum check` gate.
 
 It is packaged as a Pi package plus a thin `continuum` launcher.
 
@@ -63,16 +63,29 @@ Otherwise, `continuum new` copies the extension into the project and does not re
 
 It does **not** vendor `pi-clm` or `pi-subagents`. They remain separate upstream packages.
 
-`continuum new` writes this into the project’s `.pi/settings.json`:
+`continuum new` merges these requirements into the project’s `.pi/settings.json`,
+preserving existing keys and packages:
 
 ```json
 {
   "packages": [
     "npm:@lolipopshock/pi-clm@1.0.0",
     "npm:pi-subagents@0.79.1"
-  ]
+  ],
+  "subagents": {
+    "defaultExtensions": [],
+    "agentOverrides": {
+      "verifier": {
+        "model": "deepseek/deepseek-flash"
+      }
+    }
+  }
 }
 ```
+
+Core agents also declare an empty `extensions:` list, so background children do not get a
+second copy of `pi-clm` or the Continuum ledger extension. The verifier runs in
+the foreground (`async: false`).
 
 Pi installs those pinned packages into the project’s `.pi/npm/` directory on the first trusted run. To preinstall them manually:
 
@@ -86,6 +99,10 @@ Optional, only when using the researcher example:
 ```bash
 pi install npm:pi-web-access@0.42.0
 ```
+
+Because the base template sets `subagents.defaultExtensions: []`, a copied
+example agent must name the web-access extension explicitly in its `extensions`
+frontmatter. See [examples/README.md](examples/README.md).
 
 ### Avoid duplicates
 
@@ -112,7 +129,12 @@ acme/
 └── PROJECT_SKILLS.md       how to add project-local capabilities
 ```
 
-`acme` is a generated wrapper for `continuum open acme`. The wrapper is placed in `~/.local/bin` when that directory is on `PATH`; otherwise Continuum uses `~/.pi/agent/bin`.
+`acme` is a generated wrapper for `continuum open acme`. The wrapper is placed in `~/.local/bin` when that directory is on `PATH`; otherwise Continuum uses `~/.pi/agent/bin`. Reserved command names (`pi`, `continuum`, `git`, `node`, …) and names that already resolve to another command are refused unless you pass `--no-link`.
+
+For an existing repository, `new` merges the required ignore rules and Pi
+settings instead of replacing them, and creates `.agent/.gitignore` as a
+defense in depth. `--force` backs up overwritten template files under
+`.agent/backups/` before replacing them.
 
 On first run, Pi will ask you to trust the project configuration. Review `.pi/` before approving.
 
@@ -125,7 +147,8 @@ continuum status <name>
 continuum doctor <name>
 continuum seal <name>
 continuum fork-day <name>
-continuum verify <name> [--root <path>]
+continuum verify <name> [--root <path>] [--allow-empty]
+continuum check <name>
 continuum backup <name>
 continuum list
 continuum path <name>
@@ -138,19 +161,19 @@ Creates the project scaffold, registry entry, and optional `~/.local/bin/<name>`
 Options:
 
 ```text
---model <provider/model>          default: deepseek/deepseek-flash
---verifier-model <provider/model> default: deepseek/deepseek-flash
---thinking <level>                default: high
+--model <provider/model>          lead model; default: deepseek/deepseek-flash
+--verifier-model <provider/model> effective verifier model; default: deepseek/deepseek-flash
+--thinking <level>                lead thinking level; default: high
 --rollover snapshot|fork          default: snapshot
 --no-link                         do not create the wrapper
---force                           overwrite metadata/template files
+--force                           overwrite metadata/template files with backups
 ```
 
 ### `open`
 
 Fast preflight, then:
 
-1. attach to the live tmux session, if present;
+1. attach to the live tmux session, if present and tmux is wanted;
 2. otherwise resume the active session;
 3. if the UTC day changed, seal the old day and continue or fork according to `rollover.mode`;
 4. launch Pi with CLM environment and the project config.
@@ -158,10 +181,16 @@ Fast preflight, then:
 Useful flags:
 
 ```text
---dry-run          print the command and CLM environment
+--dry-run          print the plan, command, and CLM environment; no seals, no attach, no launch
 --no-preflight     skip the fast checks
---no-tmux          run Pi directly, without tmux
+--no-tmux          run Pi directly, even if the project tmux session exists
 ```
+
+A direct launch holds `.agent/locks/open.lock` for the life of the Pi process.
+tmux panes use an internal launcher to hold the same lock across `exec`. A
+second launch (direct or tmux) fails instead of writing the same session
+concurrently. `seal`, `backup`, and `verify` take the corresponding exclusive
+or shared lock.
 
 ### `seal`
 
@@ -182,11 +211,26 @@ Copies the active session into:
 
 ### `verify`
 
-Recomputes the archive hash and seal chain. Fails closed on missing files, tampering, or a broken seal.
+Recomputes the session hash, seal, and the manifest inventory. It fails closed
+when the archive root, ledger, manifest, seal, session, or archived evidence is
+missing or changed, and when the archive contains an unlisted file. `--root`
+verifies a restored `.agent/` tree; `--allow-empty` is the explicit opt-in for a
+project with no archives yet.
+
+The seal is a local integrity check, not a retained cryptographic chain: each
+archive keeps only its latest seal and the previous seal hash. Use external
+backup/versioning when you need historical proof.
+
+### `check`
+
+Validates `VERDICT.json` against the `AC-*` acceptance checks in `TASK.md`.
+It requires overall `PASS`, a `PASS` entry with evidence for every acceptance
+check, and records a `done_gate` ledger event. This is the deterministic gate
+the verifier and lead must run before declaring work done.
 
 ### `fork-day`
 
-Creates a new session from the current one with `pi --fork`, preserving the CLM projection. Refuses while the project tmux session is running.
+Creates a new session from the current one with `pi --fork`, preserving the CLM projection. Refuses while the project tmux session is running or the project writer lock is held. The new session ID includes a UTC time suffix, so same-day forks do not collide.
 
 ## Rollover
 
@@ -224,9 +268,13 @@ Add them per project when needed. `PROJECT_SKILLS.md` documents the workflow.
 - every acceptance check has evidence,
 - tests/lint/typecheck pass,
 - verifier returns `PASS`,
+- `continuum check <name>` returns `PASS`,
 - no unresolved high-risk item remains.
 
-This improves reliability; it does not guarantee “100% correct” results.
+`continuum check` is a deterministic command gate; Pi does not prevent a lead
+from ignoring it. The project `AGENTS.md`, verifier prompt, and verification
+skill require it. This improves reliability; it does not guarantee “100%
+correct” results.
 
 ## Design constraints
 
@@ -289,7 +337,14 @@ Project runtime state lives in each repo’s `.agent/` directory. Remove it only
 make test
 ```
 
-The smoke test creates a temporary project, seals a synthetic session, verifies it, tampers with it, and confirms verification fails.
+`make test` runs the smoke test, the regression suite, and the TypeScript
+extension checks. The smoke test creates a temporary project, seals a synthetic
+session, verifies it, tampers with it, and confirms verification fails. The
+regression suite covers fail-closed verification, JSONL corruption, dry-run/tmux
+precedence, writer locks, existing repository merges, reserved wrapper names,
+fork IDs, the completion gate, and effective verifier configuration. The
+extension checks run the real TypeScript handlers against a synthetic project,
+including the subagent guard and malformed-JSONL path.
 
 See:
 

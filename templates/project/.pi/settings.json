@@ -10,6 +10,12 @@
   ],
   "subagents": {
     "defaultModel": "deepseek/deepseek-flash",
-    "defaultThinking": "high"
+    "defaultThinking": "high",
+    "defaultExtensions": [],
+    "agentOverrides": {
+      "verifier": {
+        "model": "deepseek/deepseek-flash"
+      }
+    }
   }
 }

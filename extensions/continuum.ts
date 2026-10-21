@@ -1,5 +1,5 @@
 /**
- * project-ledger.ts — draft skeleton
+ * Continuum project ledger
  *
  * Writes a UTC audit ledger and day snapshots for a Pi project.
  *
@@ -7,14 +7,14 @@
  * - it never rewrites the live Pi session;
  * - it copies only complete JSONL entries into day snapshots;
  * - it writes manifests atomically;
+ * - subagent child sessions are inert;
  * - snapshot failures are logged, never allowed to break the agent turn.
- *
- * Install as a project extension under .pi/extensions/project-ledger.ts.
  */
 
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
+  copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -22,9 +22,10 @@ import {
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Ctx = any;
@@ -40,6 +41,15 @@ const AGENT_DIR = ".agent";
 const PROJECT_FILE = join(AGENT_DIR, "project.json");
 const LEDGER_FILE = join(AGENT_DIR, "ledger.ndjson");
 const ACTIVE_FILE = join(AGENT_DIR, "active.json");
+const EVIDENCE_FILES = [
+  "TASK.md",
+  "PLAN.md",
+  "VERDICT.json",
+  "HANDOFF.md",
+  "diff.patch",
+  "tests.log",
+];
+const REQUIRED_EVIDENCE = ["TASK.md", "PLAN.md"];
 
 let lastSnapshotDay: string | null = null;
 
@@ -84,23 +94,86 @@ function appendLedger(event: string, fields: Record<string, unknown> = {}): void
   appendFileSync(LEDGER_FILE, `${JSON.stringify(row)}\n`, "utf8");
 }
 
-/** Keep only complete JSONL records; the live session is never modified. */
+/**
+ * Keep complete JSONL records; the live session is never modified.
+ * Only a partial final line is droppable. A malformed line with data after it
+ * is corruption and must abort the snapshot instead of truncating history.
+ */
 function readCompleteJsonl(path: string): string {
   const raw = readFileSync(path, "utf8");
   const lines = raw.split("\n");
   const kept: string[] = [];
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].replace(/\r$/, "");
     if (!line.trim()) continue;
     try {
       JSON.parse(line);
-      kept.push(line);
-    } catch {
-      // Drop a partial trailing line only. A malformed middle line is left out
-      // of the snapshot and will show up in verify as a missing entry.
+    } catch (error) {
+      const later = lines.slice(index + 1).some((candidate) => candidate.trim());
+      if (later) {
+        throw new Error(`malformed JSONL at line ${index + 1}: ${String(error)}`);
+      }
       break;
     }
+    kept.push(line);
   }
   return `${kept.join("\n")}\n`;
+}
+
+function jsonlStats(text: string): { entryCount: number; lastEntryId: string | null } {
+  const rows = text.split("\n").filter((line) => line.trim());
+  let lastEntryId: string | null = null;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    try {
+      const row = JSON.parse(rows[index]);
+      if (row && typeof row.id === "string") {
+        lastEntryId = row.id;
+        break;
+      }
+    } catch {
+      // readCompleteJsonl already validated these lines.
+    }
+  }
+  return { entryCount: rows.length, lastEntryId };
+}
+
+function inventory(root: string): Record<string, { sha256: string; bytes: number }> {
+  const files: Record<string, { sha256: string; bytes: number }> = {};
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        const rel = relative(root, full).split(sep).join("/");
+        if (rel === "manifest.json" || rel === "seal.json") continue;
+        files[rel] = {
+          sha256: sha256(readFileSync(full)),
+          bytes: statSync(full).size,
+        };
+      }
+    }
+  };
+  walk(root);
+  return files;
+}
+
+function copyEvidence(dayDir: string): string[] {
+  const root = process.cwd();
+  for (const name of EVIDENCE_FILES) {
+    const source = join(root, name);
+    const destination = join(dayDir, name);
+    if (existsSync(source)) {
+      copyFileSync(source, destination);
+    } else if (existsSync(destination)) {
+      unlinkSync(destination);
+    }
+  }
+  return REQUIRED_EVIDENCE.filter((name) => !existsSync(join(root, name)));
+}
+
+function isSubagentChild(): boolean {
+  return process.env.PI_SUBAGENT_CHILD === "1";
 }
 
 function sessionIdFromFile(sessionFile: string): string {
@@ -113,11 +186,13 @@ function sessionIdFromFile(sessionFile: string): string {
   }
 }
 
-function snapshot(ctx: Ctx, reason: string): void {
-  const sessionFile = ctx.sessionManager?.getSessionFile?.();
-  if (!sessionFile || !existsSync(sessionFile)) return;
+function snapshot(ctx: Ctx, reason: string, archiveDay = utcDay()): void {
+  const rawSessionFile = ctx.sessionManager?.getSessionFile?.();
+  if (!rawSessionFile) return;
+  const sessionFile = resolve(rawSessionFile);
+  if (!existsSync(sessionFile)) return;
 
-  const day = utcDay();
+  const day = archiveDay;
   const sessionId = sessionIdFromFile(sessionFile);
   const dayDir = join(AGENT_DIR, "sessions", "days", day, sessionId);
   ensureDir(dayDir);
@@ -159,6 +234,8 @@ function snapshot(ctx: Ctx, reason: string): void {
     cpSync(interactiveDir, join(dayDir, "artifacts"), { recursive: true, force: true });
   }
 
+  const missingEvidence = copyEvidence(dayDir);
+  const stats = jsonlStats(complete);
   const leaf = ctx.sessionManager?.getLeafEntry?.();
   const manifest = {
     project: readProject()?.name ?? null,
@@ -169,8 +246,13 @@ function snapshot(ctx: Ctx, reason: string): void {
     snapshot_at: nowIso(),
     reason,
     model: ctx.model?.id ?? ctx.model?.modelId ?? null,
+    source_bytes: statSync(sessionFile).size,
     bytes: statSync(snapshotFile).size,
     sha256: sha256(complete),
+    entry_count: stats.entryCount,
+    last_entry_id: stats.lastEntryId,
+    missing_evidence: missingEvidence,
+    files: inventory(dayDir),
   };
   atomicWrite(join(dayDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -188,12 +270,15 @@ function snapshot(ctx: Ctx, reason: string): void {
   };
   atomicWrite(previousSealPath, `${JSON.stringify(seal, null, 2)}\n`);
   appendLedger("day_seal", { day, session_id: sessionId, reason, sha256: manifest.sha256 });
-  lastSnapshotDay = day;
+  // The archive day may be yesterday when sealing at a UTC boundary; the
+  // session itself is now in the current day.
+  lastSnapshotDay = utcDay();
 }
 
 function writeActive(ctx: Ctx): void {
-  const sessionFile = ctx.sessionManager?.getSessionFile?.();
-  if (!sessionFile) return;
+  const rawSessionFile = ctx.sessionManager?.getSessionFile?.();
+  if (!rawSessionFile) return;
+  const sessionFile = resolve(rawSessionFile);
   const leaf = ctx.sessionManager?.getLeafEntry?.();
   const active = {
     project: readProject()?.name ?? null,
@@ -209,7 +294,7 @@ function writeActive(ctx: Ctx): void {
 
 export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx: Ctx) => {
-    if (!isContinuumProject()) return;
+    if (!isContinuumProject() || isSubagentChild()) return;
     ensureDir(AGENT_DIR);
     ensureDir(join(AGENT_DIR, "sessions", "days"));
     writeActive(ctx);
@@ -220,11 +305,11 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("turn_end", async (_event, ctx: Ctx) => {
-    if (!isContinuumProject()) return;
+    if (!isContinuumProject() || isSubagentChild()) return;
     const day = utcDay();
     if (lastSnapshotDay && lastSnapshotDay !== day) {
       try {
-        snapshot(ctx, "utc-day-boundary");
+        snapshot(ctx, "utc-day-boundary", lastSnapshotDay);
       } catch (error) {
         appendLedger("snapshot_error", { reason: "utc-day-boundary", error: String(error) });
       }
@@ -237,7 +322,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx: Ctx) => {
-    if (!isContinuumProject()) return;
+    if (!isContinuumProject() || isSubagentChild()) return;
     try {
       snapshot(ctx, "session-shutdown");
     } catch (error) {

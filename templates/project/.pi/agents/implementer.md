@@ -5,6 +5,7 @@ model: deepseek/deepseek-flash
 thinking: high
 tools: read, write, edit, bash, grep, find, ls
 systemPromptMode: append
+extensions:
 async: true
 acceptanceRole: writer
 advertise: true
